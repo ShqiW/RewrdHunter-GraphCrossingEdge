@@ -10,7 +10,7 @@ from collections import deque
 import time
 from tqdm import tqdm
 
-from src.env import GraphLayoutEnv, MultiGraphEnv
+from src.enviroment import GraphLayoutEnv, MultiGraphEnv
 from src.models import GNNPolicy, MLPPolicy
 
 
