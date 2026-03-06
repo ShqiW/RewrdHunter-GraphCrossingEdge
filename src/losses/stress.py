@@ -1,5 +1,15 @@
+"""
+Stress Loss for Structure Consistency.
+
+Stress = Σ_{i<j} w_ij * (d_layout - α * d_graph)²
+
+Where:
+- w_ij = 1 / d_graph² (closer pairs matter more)
+- α = scaling factor (computed adaptively)
+"""
 import networkx as nx
 import torch
+
 
 class StressLoss:
     def __init__(self, G: nx.Graph, device=None, soft = True):

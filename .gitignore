@@ -71,3 +71,7 @@ results/
 !data/train_graph.txt
 !data/test_graph.txt
 
+entry/__init__.py
+.controller
+*.lock
+*.md

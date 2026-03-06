@@ -14,10 +14,21 @@ dependencies = [
     "numpy (>=2.4.2,<3.0.0)",
     "matplotlib (>=3.10.8,<4.0.0)",
     "gymnasium (>=1.2.3,<2.0.0)",
-    "torch-geometric (>=2.7.0,<3.0.0)"
+    "torch-geometric (>=2.7.0,<3.0.0)",
+    "controller (>=0.1.1,<0.2.0)",
 ]
-
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+
+[[tool.poetry.source]]
+name = "coredumped"
+url = "https://pypi.coredumped.tech/simple/"
+priority = "supplemental"
+
+[tool.poetry.dependencies]
+controller = {source = "coredumped"}

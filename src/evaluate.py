@@ -7,7 +7,7 @@ import csv
 from pathlib import Path
 from tqdm import tqdm
 
-from src.env import GraphLayoutEnv
+from src.enviroment import GraphLayoutEnv
 from src.models import GNNPolicy
 
 
