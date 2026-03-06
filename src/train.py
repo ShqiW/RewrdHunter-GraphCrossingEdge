@@ -516,7 +516,7 @@ def train(args: BaseArgs):
     trainer = PPOTrainer(policy=model, env=env, args=args, dataset=dataset)
 
     # Load checkpoint if specified
-    if hasattr(args, 'load_checkpoint') and args.load_checkpoint:
+    if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
 
     trained_policy = trainer.train()

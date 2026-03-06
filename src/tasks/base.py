@@ -83,3 +83,4 @@ class BaseArgs(ExampleArgs):
     device: str = "cpu"
     save_path: str = "checkpoints"
     log_interval: int = 10
+    load_checkpoint: str = ""
