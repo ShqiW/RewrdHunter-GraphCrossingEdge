@@ -75,3 +75,4 @@ entry/__init__.py
 .controller
 *.lock
 *.md
+*.json
