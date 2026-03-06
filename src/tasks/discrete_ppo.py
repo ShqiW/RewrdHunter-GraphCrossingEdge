@@ -40,3 +40,4 @@ class DiscretePPOArgs(BaseArgs):
     device: str = "cpu"
     save_path: str = "checkpoints/discrete_ppo"
     log_interval: int = 10
+    load_checkpoint: str = ""  # Path to checkpoint to resume training

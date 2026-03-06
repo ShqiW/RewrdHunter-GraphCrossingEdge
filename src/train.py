@@ -132,6 +132,7 @@ class PPOTrainer:
 
         self.optimizer = optim.Adam(policy.parameters(), lr=ppo.lr)
         self.buffer = RolloutBuffer()
+        self.start_update = 0  # For resuming training
 
         self.history = {
             "episode_rewards": [],
@@ -140,6 +141,16 @@ class PPOTrainer:
             "losses": [],
             "entropies": [],
         }
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint to resume training"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.policy.load_state_dict(checkpoint["policy_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.start_update = checkpoint["update"]
+        self.history = checkpoint["history"]
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"Resuming from update {self.start_update}")
 
     def compute_gae(self, rewards, values, dones, next_value):
         """Compute Generalized Advantage Estimation"""
@@ -344,12 +355,14 @@ class PPOTrainer:
         print(f"Starting PPO training: {self.args.name}")
         print(f"Action space: {self.env.num_actions} actions")
         print(f"Total timesteps: {total_timesteps}, Updates: {n_updates}")
+        if self.start_update > 0:
+            print(f"Resuming from update: {self.start_update}")
         print(f"Device: {self.device}")
         print("=" * 60)
 
         best_avg_improvement = float('-inf')
 
-        for update in tqdm(range(1, n_updates + 1), desc="Training"):
+        for update in tqdm(range(self.start_update + 1, n_updates + 1), desc="Training", initial=self.start_update, total=n_updates):
             stats = self.update()
 
             if self.history["episode_improvements"]:
@@ -501,6 +514,11 @@ def train(args: BaseArgs):
 
     # Create trainer and train
     trainer = PPOTrainer(policy=model, env=env, args=args, dataset=dataset)
+
+    # Load checkpoint if specified
+    if hasattr(args, 'load_checkpoint') and args.load_checkpoint:
+        trainer.load_checkpoint(args.load_checkpoint)
+
     trained_policy = trainer.train()
 
     return trained_policy, env, trainer.history
