@@ -76,3 +76,5 @@ entry/__init__.py
 *.lock
 *.md
 *.json
+data/
+*.sh

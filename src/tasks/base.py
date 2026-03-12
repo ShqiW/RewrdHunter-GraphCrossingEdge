@@ -11,8 +11,8 @@ from controller.doeargs.args import ExampleArgs
 class BaseEnvConfig:
     """Base environment configuration"""
     type: str = "base"
-    max_steps: int = 100
-    patience: int = 20
+    max_steps: Optional[int] = None
+    patience: Optional[int] = None
     move_scale: float = 0.05
     initial_layout: str = "random"  # random, neato, sfdp, spring
 
@@ -50,7 +50,7 @@ class BasePPOConfig:
 class BaseGraphConfig:
     """Graph configuration"""
     # Single graph mode
-    graph_path: Optional[str] = None
+    graph_path: Optional[str] = ""
     num_nodes: int = 15
     edge_prob: float = 0.15
 
@@ -77,10 +77,12 @@ class BaseArgs(ExampleArgs):
     reward: BaseRewardConfig = field(default_factory=BaseRewardConfig)
     ppo: BasePPOConfig = field(default_factory=BasePPOConfig)
     graph: BaseGraphConfig = field(default_factory=BaseGraphConfig)
+    job_name: str = ""
 
     # Training
     total_timesteps: int = 50000
-    device: str = "cpu"
     save_path: str = "checkpoints"
     log_interval: int = 10
-    load_checkpoint: str = ""
+
+    if_train: bool = False
+    if_plot: bool = False

@@ -7,7 +7,7 @@ Action encoding: action = node_id * 8 + direction_id
 
 State Space (GAT features):
 - Node features: [x, y, degree]
-- Edge features: [edge_length, is_crossing]
+- Edge features: [edge_length]
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -16,23 +16,23 @@ from gymnasium import spaces
 import numpy as np
 import networkx as nx
 import torch
-from pathlib import Path
 
 from src.tasks.base import BaseEnvConfig
 from src.losses.xing import XingLoss
 
-
 # 8 direction unit vectors
-DIRECTIONS = np.array([
-    [0, 1],    # 0: ↑
-    [1, 1],    # 1: ↗
-    [1, 0],    # 2: →
-    [1, -1],   # 3: ↘
-    [0, -1],   # 4: ↓
-    [-1, -1],  # 5: ↙
-    [-1, 0],   # 6: ←
-    [-1, 1],   # 7: ↖
-], dtype=np.float32)
+DIRECTIONS = np.array(
+    [
+        [0, 1],  # 0: ↑
+        [1, 1],  # 1: ↗
+        [1, 0],  # 2: →
+        [1, -1],  # 3: ↘
+        [0, -1],  # 4: ↓
+        [-1, -1],  # 5: ↙
+        [-1, 0],  # 6: ←
+        [-1, 1],  # 7: ↖
+    ],
+    dtype=np.float32)
 
 # Normalize direction vectors
 DIRECTIONS = DIRECTIONS / np.linalg.norm(DIRECTIONS, axis=1, keepdims=True)
@@ -53,7 +53,7 @@ class DiscreteEnvConfig(BaseEnvConfig):
     structure_method: str = "softmax"
 
     # Method-specific parameters
-    softmax_tau: Optional[float] = None  # None = adaptive mean(d_graph)
+    softmax_tau: Optional[float] = 1  # None = adaptive mean(d_graph)
 
     use_potential_shaping: bool = True
 
@@ -71,17 +71,13 @@ class DiscreteGraphEnv(gym.Env):
 
     def __init__(
         self,
-        graph: nx.Graph = None,
-        graph_path: str = None,
-        graph_data=None,  # GraphData from RomeDataset
-        config: DiscreteEnvConfig = None,
-        **kwargs,
+        # graph: nx.Graph,
+        # graph_path: str,
+        graph_data,  # GraphData from RomeDataset
+        device: torch.cuda.device,
+        config: DiscreteEnvConfig,
     ):
         super().__init__()
-
-        # Use config or kwargs
-        if config is None:
-            config = DiscreteEnvConfig(**kwargs)
 
         self.config = config
         self.max_steps = config.max_steps
@@ -91,6 +87,7 @@ class DiscreteGraphEnv(gym.Env):
         self.crossing_weight = config.crossing_weight
         self.structure_weight = config.structure_weight
         self.use_potential_shaping = config.use_potential_shaping
+        self.device = device
 
         # Load graph from various sources
         if graph_data is not None:
@@ -102,7 +99,8 @@ class DiscreteGraphEnv(gym.Env):
             # Build nx.Graph for XingLoss
             self.graph = nx.Graph()
             self.graph.add_nodes_from(range(self.num_nodes))
-            edges = self.edge_index.T[:self.edge_index.shape[1] // 2]  # Remove duplicates
+            edges = self.edge_index.T[:self.edge_index.shape[1] //
+                                      2]  # Remove duplicates
             self.graph.add_edges_from(edges.tolist())
 
         elif graph is not None:
@@ -112,7 +110,8 @@ class DiscreteGraphEnv(gym.Env):
 
         elif graph_path is not None:
             self.graph = nx.read_graphml(graph_path)
-            self.graph = nx.convert_node_labels_to_integers(self.graph, ordering="sorted")
+            self.graph = nx.convert_node_labels_to_integers(self.graph,
+                                                            ordering="sorted")
             self.num_nodes = self.graph.number_of_nodes()
             self.graph_name = graph_path
 
@@ -121,6 +120,10 @@ class DiscreteGraphEnv(gym.Env):
 
         self.num_edges = self.graph.number_of_edges()
 
+        # Dynamic max_steps and patience based on graph size
+        self.max_steps = config.max_steps if config.max_steps is not None else self.num_nodes * 10
+        self.patience = config.patience if config.patience is not None else self.num_nodes * 3
+
         # Adjacency matrix and edge list (from nx.Graph)
         self.adj_matrix = nx.to_numpy_array(self.graph, dtype=np.float32)
         if graph_data is None:
@@ -128,12 +131,15 @@ class DiscreteGraphEnv(gym.Env):
             if len(edges) > 0:
                 edge_arr = np.array(edges, dtype=np.int64).T
                 # Make undirected (both directions)
-                self.edge_index = np.concatenate([edge_arr, edge_arr[::-1]], axis=1)
+                self.edge_index = np.concatenate([edge_arr, edge_arr[::-1]],
+                                                 axis=1)
             else:
                 self.edge_index = np.zeros((2, 0), dtype=np.int64)
 
         # Node degree (fixed throughout training)
-        self.degree = np.array([self.graph.degree(i) for i in range(self.num_nodes)], dtype=np.float32)
+        self.degree = np.array(
+            [self.graph.degree(i) for i in range(self.num_nodes)],
+            dtype=np.float32)
 
         # Discrete action space
         self.num_actions = self.num_nodes * NUM_DIRECTIONS
@@ -142,25 +148,38 @@ class DiscreteGraphEnv(gym.Env):
         # Observation space: node features [x, y, degree]
         # Note: actual observation includes dynamic edge features computed separately
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_nodes, 3), dtype=np.float32
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.num_nodes, 3),
+            dtype=np.float32,
         )
 
         # Loss calculators
-        self.xing_loss = XingLoss(self.graph, soft=config.soft_crossing)
+        self.xing_loss = XingLoss(
+            self.graph,
+            soft=config.soft_crossing,
+            device=device,
+        )
 
         # Structure loss (select method based on config)
         match config.structure_method:
             case "stress":
                 from src.losses.stress import StressLoss
-                self.structure_loss = StressLoss(self.graph)
+                self.structure_loss = StressLoss(self.graph, device=device)
             case "rank":
                 from src.losses.rank_matching import RankMatchingLoss
-                self.structure_loss = RankMatchingLoss(self.graph, tau=config.softmax_tau)
+                self.structure_loss = RankMatchingLoss(
+                    self.graph,
+                    tau=config.softmax_tau,
+                    device=device,
+                )
             case "softmax":
                 from src.losses.softmax_ranking import SoftmaxRankingLoss
-                self.structure_loss = SoftmaxRankingLoss(self.graph, tau=config.softmax_tau)
+                self.structure_loss = SoftmaxRankingLoss(
+                    G=self.graph, device=device, tau=config.softmax_tau)
             case _:
-                raise ValueError(f"Unknown structure method: {config.structure_method}")
+                raise ValueError(
+                    f"Unknown structure method: {config.structure_method}")
 
         # State variables
         self.coords = None
@@ -182,7 +201,11 @@ class DiscreteGraphEnv(gym.Env):
 
     def _compute_structure(self, coords: np.ndarray) -> float:
         """Compute structure loss (edge length + overlap)"""
-        coords_tensor = torch.tensor(coords, dtype=torch.float32)
+        coords_tensor = torch.tensor(
+            coords,
+            dtype=torch.float32,
+            device=self.device,
+        )
         return self.structure_loss(coords_tensor).item()
 
     def _compute_potential(self, coords: np.ndarray) -> float:
@@ -202,82 +225,46 @@ class DiscreteGraphEnv(gym.Env):
         lengths = np.linalg.norm(diff, axis=1).astype(np.float32)
         return lengths
 
-    def _compute_edge_crossings(self, coords: np.ndarray) -> np.ndarray:
-        """
-        Compute which edges are crossing (0 or 1 per edge).
-        Returns binary array of shape [num_edges].
-        """
-        num_edges_undirected = self.edge_index.shape[1] // 2
-        if num_edges_undirected == 0:
-            return np.array([], dtype=np.float32)
-
-        # Get undirected edges (first half)
-        edges = self.edge_index[:, :num_edges_undirected].T
-
-        # Check each pair of edges for crossing
-        is_crossing = np.zeros(num_edges_undirected, dtype=np.float32)
-
-        for i, (u1, v1) in enumerate(edges):
-            p1, p2 = coords[u1], coords[v1]
-            for j, (u2, v2) in enumerate(edges[i+1:], i+1):
-                # Skip adjacent edges
-                if u1 == u2 or u1 == v2 or v1 == u2 or v1 == v2:
-                    continue
-                p3, p4 = coords[u2], coords[v2]
-                if self._segments_intersect(p1, p2, p3, p4):
-                    is_crossing[i] = 1.0
-                    is_crossing[j] = 1.0
-
-        # Duplicate for both directions
-        return np.concatenate([is_crossing, is_crossing])
-
-    def _segments_intersect(self, p1, p2, p3, p4) -> bool:
-        """Check if line segment p1-p2 intersects p3-p4"""
-        def ccw(A, B, C):
-            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-
-        return (ccw(p1,p3,p4) != ccw(p2,p3,p4)) and (ccw(p1,p2,p3) != ccw(p1,p2,p4))
-
     def _get_node_features(self, coords: np.ndarray) -> np.ndarray:
         """
         Get node features: [x, y, degree]
         Shape: [num_nodes, 3]
         """
-        features = np.column_stack([
-            coords,
-            self.degree.reshape(-1, 1)
-        ]).astype(np.float32)
+        features = np.column_stack([coords,
+                                    self.degree.reshape(-1,
+                                                        1)]).astype(np.float32)
         return features
 
     def _get_edge_features(self, coords: np.ndarray) -> np.ndarray:
         """
-        Get edge features: [edge_length, is_crossing]
-        Shape: [num_edges, 2]
+        Get edge features: [edge_length]
+        Shape: [num_edges, 1]
         """
         edge_lengths = self._compute_edge_lengths(coords)
-        is_crossing = self._compute_edge_crossings(coords)
 
         if len(edge_lengths) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
+            return np.zeros((0, 1), dtype=np.float32)
 
-        features = np.column_stack([
-            edge_lengths,
-            is_crossing
-        ]).astype(np.float32)
-        return features
+        return edge_lengths.reshape(-1, 1).astype(np.float32)
 
     def _get_initial_layout(self) -> np.ndarray:
         if self.initial_layout == "random":
             coords = np.random.rand(self.num_nodes, 2).astype(np.float32)
         elif self.initial_layout == "neato":
             pos = nx.nx_agraph.graphviz_layout(self.graph, prog="neato")
-            coords = np.array([[pos[v][0], pos[v][1]] for v in self.graph.nodes()], dtype=np.float32)
+            coords = np.array([[pos[v][0], pos[v][1]]
+                               for v in self.graph.nodes()],
+                              dtype=np.float32)
         elif self.initial_layout == "sfdp":
             pos = nx.nx_agraph.graphviz_layout(self.graph, prog="sfdp")
-            coords = np.array([[pos[v][0], pos[v][1]] for v in self.graph.nodes()], dtype=np.float32)
+            coords = np.array([[pos[v][0], pos[v][1]]
+                               for v in self.graph.nodes()],
+                              dtype=np.float32)
         else:
             pos = nx.spring_layout(self.graph)
-            coords = np.array([[pos[v][0], pos[v][1]] for v in self.graph.nodes()], dtype=np.float32)
+            coords = np.array([[pos[v][0], pos[v][1]]
+                               for v in self.graph.nodes()],
+                              dtype=np.float32)
 
         return self._normalize_coords(coords)
 
@@ -344,16 +331,12 @@ class DiscreteGraphEnv(gym.Env):
         if self.use_potential_shaping:
             gamma = 0.99
             potential_shaping = gamma * new_potential - old_potential
-            reward = (
-                self.crossing_weight * crossing_reward +
-                self.structure_weight * structure_reward +
-                0.5 * potential_shaping
-            )
+            reward = (self.crossing_weight * crossing_reward +
+                      self.structure_weight * structure_reward +
+                      0.5 * potential_shaping)
         else:
-            reward = (
-                self.crossing_weight * crossing_reward +
-                self.structure_weight * structure_reward
-            )
+            reward = (self.crossing_weight * crossing_reward +
+                      self.structure_weight * structure_reward)
 
         # Update state
         self.current_crossings = new_crossings
@@ -390,7 +373,8 @@ class DiscreteGraphEnv(gym.Env):
             "initial_crossings": self.initial_crossings,
             "initial_structure": self.initial_structure,
             "improvement": self.initial_crossings - self.current_crossings,
-            "structure_improvement": self.initial_structure - self.current_structure,
+            "structure_improvement":
+            self.initial_structure - self.current_structure,
             "steps": self.steps,
             "action_node": node_id,
             "action_direction": direction_id,

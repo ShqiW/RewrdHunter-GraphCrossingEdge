@@ -37,7 +37,8 @@ class RolloutBuffer:
         self.values = []
         self.dones = []
 
-    def add(self, node_features, edge_index, edge_attr, action, log_prob, reward, value, done):
+    def add(self, node_features, edge_index, edge_attr, action, log_prob,
+            reward, value, done):
         self.node_features.append(node_features)
         self.edge_indices.append(edge_index)
         self.edge_attrs.append(edge_attr)
@@ -59,11 +60,9 @@ def create_graph(args: BaseArgs) -> nx.Graph:
         graph = nx.read_graphml(graph_config.graph_path)
         graph = nx.convert_node_labels_to_integers(graph, ordering="sorted")
     else:
-        graph = nx.erdos_renyi_graph(
-            graph_config.num_nodes,
-            graph_config.edge_prob,
-            seed=args.seed
-        )
+        graph = nx.erdos_renyi_graph(graph_config.num_nodes,
+                                     graph_config.edge_prob,
+                                     seed=args.seed)
         # Ensure connected
         if not nx.is_connected(graph):
             components = list(nx.connected_components(graph))
@@ -75,19 +74,30 @@ def create_graph(args: BaseArgs) -> nx.Graph:
     return graph
 
 
-def create_env(args: BaseArgs, graph: nx.Graph = None, graph_data=None):
+def create_env(
+    args: BaseArgs,
+    # graph: nx.Graph,
+    device: torch.cuda.device,
+    graph_data,
+):
     """Create environment based on args"""
     env_type = args.env.type
 
     match env_type:
         case "discrete":
             from src.envs.discrete import DiscreteGraphEnv
+            return DiscreteGraphEnv(
+                graph_data=graph_data,
+                device=device,
+                config=args.env,
+            )
             if graph_data is not None:
                 return DiscreteGraphEnv(graph_data=graph_data, config=args.env)
             else:
                 return DiscreteGraphEnv(graph=graph, config=args.env)
         case _:
-            raise NotImplementedError(f"Environment type {env_type} not implemented")
+            raise NotImplementedError(
+                f"Environment type {env_type} not implemented")
 
 
 def create_model(args: BaseArgs, env):
@@ -99,23 +109,25 @@ def create_model(args: BaseArgs, env):
             from src.models.gnn import DiscreteGNNPolicy
             return DiscreteGNNPolicy(config=args.model)
         case _:
-            raise NotImplementedError(f"Model type {model_type} not implemented")
+            raise NotImplementedError(
+                f"Model type {model_type} not implemented")
 
 
 class PPOTrainer:
     """PPO Trainer - unified for all tasks"""
 
     def __init__(
-        self,
-        policy: nn.Module,
-        env,
-        args: BaseArgs,
-        dataset=None,  # RomeDataset for multi-graph training
+            self,
+            policy: nn.Module,
+            env,
+            device: torch.cuda.device,
+            args: BaseArgs,
+            dataset=None,  # RomeDataset for multi-graph training
     ):
-        self.policy = policy.to(args.device)
+        self.policy = policy.to(device)
         self.env = env
         self.args = args
-        self.device = args.device
+        self.device = device
         self.dataset = dataset
 
         # PPO config
@@ -142,7 +154,7 @@ class PPOTrainer:
             "entropies": [],
         }
 
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: Path):
         """Load checkpoint to resume training"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
@@ -163,12 +175,16 @@ class PPOTrainer:
             else:
                 next_val = values[t + 1]
 
-            delta = rewards[t] + self.gamma * next_val * (1 - dones[t]) - values[t]
+            delta = rewards[t] + self.gamma * next_val * (1 -
+                                                          dones[t]) - values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
             advantages.insert(0, gae)
 
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        returns = advantages + torch.tensor(values, dtype=torch.float32, device=self.device)
+        advantages = torch.tensor(advantages,
+                                  dtype=torch.float32,
+                                  device=self.device)
+        returns = advantages + torch.tensor(
+            values, dtype=torch.float32, device=self.device)
 
         return advantages, returns
 
@@ -178,12 +194,17 @@ class PPOTrainer:
             return self.env
 
         graph_data = self.dataset.sample()
-        new_env = create_env(self.args, graph_data=graph_data)
+        new_env = create_env(
+            self.args,
+            graph_data=graph_data,
+            device=self.device,
+        )
 
         # Track sampled graphs for debugging
         if not hasattr(self, '_sampled_graphs'):
             self._sampled_graphs = []
-        self._sampled_graphs.append((graph_data.graph_name, graph_data.num_nodes))
+        self._sampled_graphs.append(
+            (graph_data.graph_name, graph_data.num_nodes))
 
         return new_env
 
@@ -200,16 +221,18 @@ class PPOTrainer:
 
         for _ in range(self.n_steps):
             # obs is now node_features [num_nodes, 3]
-            node_features = torch.tensor(obs, dtype=torch.float32, device=self.device)
+            node_features = torch.tensor(obs,
+                                         dtype=torch.float32,
+                                         device=self.device)
             edge_index = graph_data["edge_index"].to(self.device)
             edge_attr = graph_data["edge_attr"].to(self.device)
 
             with torch.no_grad():
                 action, log_prob, value = self.policy.get_action(
-                    node_features, edge_index, edge_attr
-                )
+                    node_features, edge_index, edge_attr)
 
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
+            next_obs, reward, terminated, truncated, info = self.env.step(
+                action)
             done = terminated or truncated
 
             # Update graph_data for edge features (they change with layout)
@@ -227,8 +250,10 @@ class PPOTrainer:
             )
 
             if done:
-                self.history["episode_crossings"].append(info.get("crossings", 0))
-                self.history["episode_improvements"].append(info.get("improvement", 0))
+                self.history["episode_crossings"].append(
+                    info.get("crossings", 0))
+                self.history["episode_improvements"].append(
+                    info.get("improvement", 0))
 
                 # Sample new graph from dataset
                 if self.dataset is not None:
@@ -240,11 +265,14 @@ class PPOTrainer:
                 obs = next_obs
 
         # Compute next_value for GAE
-        node_features = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        node_features = torch.tensor(obs,
+                                     dtype=torch.float32,
+                                     device=self.device)
         edge_index = graph_data["edge_index"].to(self.device)
         edge_attr = graph_data["edge_attr"].to(self.device)
         with torch.no_grad():
-            _, next_value, _ = self.policy.forward(node_features, edge_index, edge_attr)
+            _, next_value, _ = self.policy.forward(node_features, edge_index,
+                                                   edge_attr)
             next_value = next_value.item()
 
         return next_value
@@ -252,15 +280,13 @@ class PPOTrainer:
     def update(self):
         """PPO update step with batched graph processing"""
         next_value = self.collect_rollouts()
-        advantages, returns = self.compute_gae(
-            self.buffer.rewards,
-            self.buffer.values,
-            self.buffer.dones,
-            next_value
-        )
+        advantages, returns = self.compute_gae(self.buffer.rewards,
+                                               self.buffer.values,
+                                               self.buffer.dones, next_value)
 
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean()) / (advantages.std() +
+                                                         1e-8)
 
         total_loss = 0
         total_pg_loss = 0
@@ -280,10 +306,8 @@ class PPOTrainer:
                 data_list = []
                 for idx in batch_indices:
                     data = Data(
-                        x=torch.tensor(
-                            self.buffer.node_features[idx],
-                            dtype=torch.float32
-                        ),
+                        x=torch.tensor(self.buffer.node_features[idx],
+                                       dtype=torch.float32),
                         edge_index=self.buffer.edge_indices[idx],
                         edge_attr=self.buffer.edge_attrs[idx],
                     )
@@ -295,35 +319,37 @@ class PPOTrainer:
                 # Get actions for this batch
                 batch_actions = torch.tensor(
                     [self.buffer.actions[i] for i in batch_indices],
-                    dtype=torch.long, device=self.device
-                )
+                    dtype=torch.long,
+                    device=self.device)
 
                 # Evaluate all graphs in one forward pass
                 batch_log_probs, batch_entropies, batch_values = self.policy.evaluate_action_batched(
-                    batched_data, batch_actions
-                )
+                    batched_data, batch_actions)
 
                 batch_old_log_probs = torch.tensor(
                     [self.buffer.log_probs[i] for i in batch_indices],
-                    dtype=torch.float32, device=self.device
-                )
+                    dtype=torch.float32,
+                    device=self.device)
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
 
                 # PPO loss
                 ratio = torch.exp(batch_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps,
+                                    1 + self.clip_eps) * batch_advantages
                 pg_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = nn.functional.mse_loss(batch_values, batch_returns)
+                value_loss = nn.functional.mse_loss(batch_values,
+                                                    batch_returns)
                 entropy_loss = -batch_entropies.mean()
 
                 loss = pg_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.policy.parameters(),
+                                         self.max_grad_norm)
                 self.optimizer.step()
 
                 total_loss += loss.item()
@@ -362,15 +388,22 @@ class PPOTrainer:
 
         best_avg_improvement = float('-inf')
 
-        for update in tqdm(range(self.start_update + 1, n_updates + 1), desc="Training", initial=self.start_update, total=n_updates):
+        for update in tqdm(range(self.start_update + 1, n_updates + 1),
+                           desc="Training",
+                           initial=self.start_update,
+                           total=n_updates):
             stats = self.update()
 
             if self.history["episode_improvements"]:
-                recent_improvements.extend(self.history["episode_improvements"][-10:])
+                recent_improvements.extend(
+                    self.history["episode_improvements"][-10:])
 
             if update % log_interval == 0:
-                avg_improvement = np.mean(list(recent_improvements)) if recent_improvements else 0
-                avg_crossings = np.mean(self.history["episode_crossings"][-100:]) if self.history["episode_crossings"] else 0
+                avg_improvement = np.mean(
+                    list(recent_improvements)) if recent_improvements else 0
+                avg_crossings = np.mean(
+                    self.history["episode_crossings"]
+                    [-100:]) if self.history["episode_crossings"] else 0
 
                 if avg_improvement > best_avg_improvement:
                     best_avg_improvement = avg_improvement
@@ -381,14 +414,19 @@ class PPOTrainer:
                 print(f"\nUpdate {update}/{n_updates}{marker}")
                 print(f"  Avg Improvement: {avg_improvement:.2f}")
                 print(f"  Avg Final Crossings: {avg_crossings:.1f}")
-                print(f"  Loss: {stats['loss']:.4f}, Entropy: {stats['entropy']:.3f}")
+                print(
+                    f"  Loss: {stats['loss']:.4f}, Entropy: {stats['entropy']:.3f}"
+                )
 
                 # Show graph sampling stats
                 if hasattr(self, '_sampled_graphs') and self._sampled_graphs:
-                    unique_graphs = len(set(g[0] for g in self._sampled_graphs))
+                    unique_graphs = len(set(g[0]
+                                            for g in self._sampled_graphs))
                     total_samples = len(self._sampled_graphs)
                     last_graph = self._sampled_graphs[-1]
-                    print(f"  Graphs: {unique_graphs} unique / {total_samples} total, last: {last_graph[0]} ({last_graph[1]} nodes)")
+                    print(
+                        f"  Graphs: {unique_graphs} unique / {total_samples} total, last: {last_graph[0]} ({last_graph[1]} nodes)"
+                    )
 
             if save_path and update % (log_interval * 10) == 0:
                 self._save_checkpoint(save_path, update)
@@ -408,13 +446,14 @@ class PPOTrainer:
         else:
             path = save_dir / f"checkpoint_{update}.pt"
 
-        torch.save({
-            "policy_state_dict": self.policy.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "update": update,
-            "history": self.history,
-            "args": asdict(self.args),
-        }, path)
+        torch.save(
+            {
+                "policy_state_dict": self.policy.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "update": update,
+                "history": self.history,
+                "args": asdict(self.args),
+            }, path)
         print(f"  Saved to {path}")
 
     def _plot_training_curves(self, save_path):
@@ -423,7 +462,7 @@ class PPOTrainer:
         def smooth(data, window=50):
             if len(data) < window:
                 return data
-            return np.convolve(data, np.ones(window)/window, mode='valid')
+            return np.convolve(data, np.ones(window) / window, mode='valid')
 
         if self.history["episode_improvements"]:
             ax = axes[0, 0]
@@ -478,6 +517,9 @@ def train(args: BaseArgs):
     3. Create model based on args.model
     4. Run PPO training
     """
+
+    device = "cuda" if torch.cuda.is_available(
+    ) and args.num_gpus > 0 else "cpu"
     print(f"Task: {args.name}")
     print(f"Seed: {args.seed}")
 
@@ -491,18 +533,29 @@ def train(args: BaseArgs):
             root=args.graph.data_root,
             split=args.graph.data_split,
         )
-        print(f"Dataset: {len(dataset)} graphs from {args.graph.data_split} split")
+        print(
+            f"Dataset: {len(dataset)} graphs from {args.graph.data_split} split"
+        )
 
         # Sample initial graph
         graph_data = dataset.sample()
-        print(f"Initial graph: {graph_data.graph_name} ({graph_data.num_nodes} nodes)")
+        print(
+            f"Initial graph: {graph_data.graph_name} ({graph_data.num_nodes} nodes)"
+        )
 
         # Create environment from dataset sample
-        env = create_env(args, graph_data=graph_data)
+        env = create_env(
+            args,
+            graph_data=graph_data,
+            device=device,
+        )
     else:
+        assert False
         # Single graph mode
         graph = create_graph(args)
-        print(f"Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
+        print(
+            f"Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
+        )
         env = create_env(args, graph=graph)
 
     obs, info = env.reset()
@@ -510,14 +563,29 @@ def train(args: BaseArgs):
 
     # Create model
     model = create_model(args, env)
-    print(f"Model: {args.model.type}, params: {sum(p.numel() for p in model.parameters())}")
+    print(
+        f"Model: {args.model.type}, params: {sum(p.numel() for p in model.parameters())}"
+    )
 
     # Create trainer and train
-    trainer = PPOTrainer(policy=model, env=env, args=args, dataset=dataset)
+    trainer = PPOTrainer(
+        policy=model,
+        env=env,
+        args=args,
+        dataset=dataset,
+        device=device,
+    )
 
-    # Load checkpoint if specified
-    if args.load_checkpoint:
-        trainer.load_checkpoint(args.load_checkpoint)
+    save_path = Path(args.save_path)
+    ckpt_path = save_path / "final_model.pt"
+    if not ckpt_path.exists():
+        checkpoints = sorted(save_path.glob("checkpoint_*.pt"))
+        if (len(checkpoints) > 0):
+            ckpt_path = checkpoints[-1]
+    if (ckpt_path.exists()):
+        print(f"Loading from {ckpt_path}")
+        # Load checkpoint if specified
+        trainer.load_checkpoint(ckpt_path)
 
     trained_policy = trainer.train()
 

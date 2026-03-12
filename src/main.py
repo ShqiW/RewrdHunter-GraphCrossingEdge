@@ -28,16 +28,20 @@ def main():
         case _:
             raise NotImplementedError(
                 f"Task '{base_args.name}' not implemented. "
-                f"Available tasks: discrete_ppo"
-            )
+                f"Available tasks: discrete_ppo")
 
-    # Stage 3: Train
-    from src.train import train
-    policy, env, history = train(args)
+    if (args.if_train):
+        # Stage 3: Train
+        from src.train import train
+        policy, env, history = train(args)
 
-    print("\n" + "=" * 60)
-    print("Training completed!")
-    print(f"Final model saved to: {args.save_path}")
+        print("\n" + "=" * 60)
+        print("Training completed!")
+        print(f"Final model saved to: {args.save_path}")
+
+    if (args.if_plot):
+        from src.plot import plot_layouts
+        plot_layouts(args)
 
 
 if __name__ == "__main__":

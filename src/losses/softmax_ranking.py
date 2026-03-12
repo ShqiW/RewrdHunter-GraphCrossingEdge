@@ -18,10 +18,11 @@ import torch.nn.functional as F
 
 
 class SoftmaxRankingLoss:
+
     def __init__(
         self,
+        device: torch.cuda.device,
         G: nx.Graph = None,
-        device=None,
         tau: float = None,
         P_graph: torch.Tensor = None,
     ):
@@ -34,8 +35,6 @@ class SoftmaxRankingLoss:
             tau: 温度参数，如果为None则自动设为 mean(d_graph)
             P_graph: 预计算的目标分布 [n, n] (如果提供，则直接使用)
         """
-        if device is None:
-            device = torch.device("cpu")
         self.device = device
 
         # 如果提供了预计算的P_graph，直接使用
@@ -48,13 +47,16 @@ class SoftmaxRankingLoss:
 
         # 否则从图计算
         if G is None:
-            raise ValueError("Must provide either G (graph) or P_graph (precomputed)")
+            raise ValueError(
+                "Must provide either G (graph) or P_graph (precomputed)")
 
         self.nodes = list(G.nodes())
         self.n = len(self.nodes)
 
         # 计算图距离（最短路径）
-        d_graph = torch.zeros((self.n, self.n), dtype=torch.float32, device=device)
+        d_graph = torch.zeros((self.n, self.n),
+                              dtype=torch.float32,
+                              device=device)
         for i, u in enumerate(self.nodes):
             sp_lengths = nx.single_source_shortest_path_length(G, u)
             for v, dist in sp_lengths.items():
@@ -78,7 +80,10 @@ class SoftmaxRankingLoss:
         # 需要排除自己 (j != i)
         self.P_graph = self._compute_softmax_distribution(d_graph)
 
-    def _compute_softmax_distribution(self, distances: torch.Tensor) -> torch.Tensor:
+    def _compute_softmax_distribution(
+        self,
+        distances: torch.Tensor,
+    ) -> torch.Tensor:
         """
         计算每个节点的softmax分布
 
@@ -113,8 +118,9 @@ class SoftmaxRankingLoss:
             d_layout: [n, n] 距离矩阵
         """
         # d_layout[i,j] = ||coords[i] - coords[j]||
-        squared_norms = (coords ** 2).sum(dim=1)
-        d_sq = squared_norms[:, None] + squared_norms[None, :] - 2 * coords @ coords.T
+        squared_norms = (coords**2).sum(dim=1)
+        d_sq = squared_norms[:, None] + squared_norms[
+            None, :] - 2 * coords @ coords.T
         d_layout = torch.sqrt(torch.clamp(d_sq, min=1e-8))
         return d_layout
 

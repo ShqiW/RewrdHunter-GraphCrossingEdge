@@ -27,7 +27,7 @@ class GNNConfig(BaseModelConfig):
     hidden_dim: int = 128
     num_gnn_layers: int = 3
     node_input_dim: int = 3  # x, y, degree
-    edge_input_dim: int = 2  # edge_length, is_crossing
+    edge_input_dim: int = 1  # edge_length
     num_heads: int = 4
     dropout: float = 0.1
 
@@ -38,7 +38,7 @@ class DiscreteGNNPolicy(nn.Module):
 
     State Space (from slides):
     - Node features: [x, y, degree]
-    - Edge features: [edge_length, is_crossing]
+    - Edge features: [edge_length]
 
     Output: Single Categorical distribution over num_nodes * 8 actions
     """

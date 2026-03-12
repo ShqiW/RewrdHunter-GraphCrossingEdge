@@ -8,9 +8,7 @@ Uses:
 """
 from dataclasses import dataclass, field
 
-from src.tasks.base import (
-    BaseArgs,
-    BasePPOConfig)
+from src.tasks.base import (BaseArgs, BasePPOConfig)
 from src.envs.discrete import DiscreteEnvConfig
 from src.models.gnn import GNNConfig
 

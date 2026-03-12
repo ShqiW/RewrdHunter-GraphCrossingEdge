@@ -23,22 +23,25 @@ class RankMatchingLoss:
     Advantage: Invariant to global scaling (only relative order matters)
     """
 
-    def __init__(self, G: nx.Graph, device=None, tau: float = None):
+    def __init__(self,
+                 G: nx.Graph,
+                 device: torch.cuda.device,
+                 tau: float = None):
         """
         Args:
             G: NetworkX graph
             device: torch device
             tau: Temperature for soft ranking. None = adaptive
         """
-        if device is None:
-            device = torch.device("cpu")
         self.device = device
 
         self.nodes = list(G.nodes())
         self.n = len(self.nodes)
 
         # Compute graph distances
-        d_graph = torch.zeros((self.n, self.n), dtype=torch.float32, device=device)
+        d_graph = torch.zeros((self.n, self.n),
+                              dtype=torch.float32,
+                              device=device)
         for i, u in enumerate(self.nodes):
             sp_lengths = nx.single_source_shortest_path_length(G, u)
             for v, dist in sp_lengths.items():
@@ -86,8 +89,9 @@ class RankMatchingLoss:
 
     def _compute_layout_distances(self, coords: torch.Tensor) -> torch.Tensor:
         """Compute pairwise Euclidean distances."""
-        squared_norms = (coords ** 2).sum(dim=1)
-        d_sq = squared_norms[:, None] + squared_norms[None, :] - 2 * coords @ coords.T
+        squared_norms = (coords**2).sum(dim=1)
+        d_sq = squared_norms[:, None] + squared_norms[
+            None, :] - 2 * coords @ coords.T
         d_layout = torch.sqrt(torch.clamp(d_sq, min=1e-8))
         return d_layout
 
