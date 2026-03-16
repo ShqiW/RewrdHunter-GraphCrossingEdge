@@ -71,10 +71,17 @@ results/
 !data/train_graph.txt
 !data/test_graph.txt
 
-entry/__init__.py
 .controller
 *.lock
 *.md
 *.json
 data/
-*.sh
+!src/data/
+.investigation
+*.tar*
+*.whl
+src/envs/_crossing.c
+*.png
+
+*.txt
+entry/__init__.py

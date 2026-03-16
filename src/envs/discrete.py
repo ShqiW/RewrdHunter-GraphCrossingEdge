@@ -47,7 +47,11 @@ class DiscreteEnvConfig(BaseEnvConfig):
 
     # Reward weights (R = w1 * ΔR_cross + w2 * ΔR_structure)
     crossing_weight: float = 1.0
+<<<<<<< HEAD
     structure_weight: float = 0.1
+=======
+    structure_weight: float = 0.3
+>>>>>>> f67fc63 (sync)
 
     # Structure consistency method: "stress" | "rank" | "softmax"
     structure_method: str = "softmax"
@@ -80,8 +84,6 @@ class DiscreteGraphEnv(gym.Env):
         super().__init__()
 
         self.config = config
-        self.max_steps = config.max_steps
-        self.patience = config.patience
         self.move_scale = config.move_scale
         self.initial_layout = config.initial_layout
         self.crossing_weight = config.crossing_weight
@@ -119,10 +121,6 @@ class DiscreteGraphEnv(gym.Env):
             raise ValueError("Must provide graph, graph_path, or graph_data")
 
         self.num_edges = self.graph.number_of_edges()
-
-        # Dynamic max_steps and patience based on graph size
-        self.max_steps = config.max_steps if config.max_steps is not None else self.num_nodes * 10
-        self.patience = config.patience if config.patience is not None else self.num_nodes * 3
 
         # Adjacency matrix and edge list (from nx.Graph)
         self.adj_matrix = nx.to_numpy_array(self.graph, dtype=np.float32)
@@ -358,10 +356,6 @@ class DiscreteGraphEnv(gym.Env):
         if self.current_crossings == 0:
             terminated = True
             reward += 10.0  # Bonus for perfect layout
-        elif self.steps >= self.max_steps:
-            truncated = True
-        elif self.no_improve_steps >= self.patience:
-            truncated = True
 
         # Return node features as observation
         node_features = self._get_node_features(self.coords)

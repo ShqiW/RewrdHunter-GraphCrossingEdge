@@ -15,15 +15,23 @@ dependencies = [
     "matplotlib (>=3.10.8,<4.0.0)",
     "gymnasium (>=1.2.3,<2.0.0)",
     "torch-geometric (>=2.7.0,<3.0.0)",
-    "controller (>=0.1.2a1,<0.2.0)",
+    "yapf (>=0.43.0,<0.44.0)",
+    "numba (>=0.60.0,<1.0.0)",
+    "cython (>=3.0.0,<4.0.0)",
+    "investigation",
 ]
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=2.0.0,<3.0.0", "cython>=3.0.0", "numpy>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 package-mode = false
+
+[tool.poetry.build]
+# Using setuptools for building the Cython extension
+script = "build.py"
+generate-setup-file = true
 
 [[tool.poetry.source]]
 name = "coredumped"
