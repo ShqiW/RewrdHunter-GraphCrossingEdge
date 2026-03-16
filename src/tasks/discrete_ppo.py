@@ -19,7 +19,6 @@ class DiscretePPOArgs(BaseArgs):
     Arguments for Discrete PPO training.
 
     All nested configs can be set via CLI:
-    --env.max_steps 200
     --model.hidden_dim 256
     --ppo.lr 1e-4
     """

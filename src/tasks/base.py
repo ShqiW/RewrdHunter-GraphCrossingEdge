@@ -1,18 +1,16 @@
 """
 Base Args for all tasks.
-Inherits from controller's ExampleArgs.
+Inherits from investigation's ExampleArgs.
 """
 from dataclasses import dataclass, field
 from typing import Optional
-from controller.doeargs.args import ExampleArgs
+from investigation.doeargs.args import ExampleArgs
 
 
 @dataclass
 class BaseEnvConfig:
     """Base environment configuration"""
     type: str = "base"
-    max_steps: Optional[int] = None
-    patience: Optional[int] = None
     move_scale: float = 0.05
     initial_layout: str = "random"  # random, neato, sfdp, spring
 
@@ -44,6 +42,7 @@ class BasePPOConfig:
     n_steps: int = 128
     n_epochs: int = 4
     batch_size: int = 64
+    n_envs: int = 1
 
 
 @dataclass
@@ -65,8 +64,7 @@ class BaseArgs(ExampleArgs):
     """
     Base arguments for all tasks.
 
-    Nested dataclasses will be flattened by controller:
-    - env.max_steps -> --env.max_steps
+    Nested dataclasses will be flattened by investigation:
     - model.hidden_dim -> --model.hidden_dim
     """
     name: str = "base"
@@ -86,3 +84,5 @@ class BaseArgs(ExampleArgs):
 
     if_train: bool = False
     if_plot: bool = False
+    if_evaluate: bool = False
+    baseline_csv: str = ""  # path to all_baselines.csv for comparison
