@@ -1,21 +1,30 @@
 from src.tasks.base import BaseArgs
 
+from src.tasks.discrete_ppo import DiscretePPOArgs
+from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
+
 
 def create_env(
     args: BaseArgs,
     device,
     graph_data,
 ):
-    env_type = args.env.type
-    match env_type:
-        case "discrete":
+    match args:
+        case DiscretePPOArgs():
             from src.envs.discrete import DiscreteGraphEnv
             return DiscreteGraphEnv(
                 graph_data=graph_data,
                 device=device,
                 config=args.env,
             )
-        case "sequential":
+        case SequentialRefinementArgs():
+            from src.envs.refinement import RefinementGraphEnv
+            return RefinementGraphEnv(
+                graph_data=graph_data,
+                device=device,
+                config=args.env,
+            )
+        case SequentialPPOArgs():
             from src.envs.sequential import SequentialGraphEnv
             return SequentialGraphEnv(
                 graph_data=graph_data,
@@ -24,4 +33,4 @@ def create_env(
             )
         case _:
             raise NotImplementedError(
-                f"Environment type '{env_type}' not implemented")
+                f"Environment type '{args.name}' not implemented")

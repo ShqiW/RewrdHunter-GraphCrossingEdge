@@ -26,13 +26,14 @@ class StressLoss:
         self.soft = soft  # not used for now
 
         # Compute graph distances once
+        node_to_idx = {u: i for i, u in enumerate(self.nodes)}
         d_graph = torch.zeros((self.n, self.n),
                               dtype=torch.float32,
                               device=device)
         for i, u in enumerate(self.nodes):
             sp_lengths = nx.single_source_shortest_path_length(G, u)
             for v, dist in sp_lengths.items():
-                j = self.nodes.index(v)
+                j = node_to_idx[v]
                 d_graph[i, j] = float(dist)
         self.d_graph = d_graph
 

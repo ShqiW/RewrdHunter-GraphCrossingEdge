@@ -14,17 +14,15 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch_geometric.nn import GATConv, global_mean_pool
 
-from src.tasks.base import BaseModelConfig
-
+from src.models.base import BasePolicy
+from src.tasks.base import BasePPOConfig
 
 NUM_DIRECTIONS = 8
 
 
 @dataclass
-class GNNConfig(BaseModelConfig):
+class GNNConfig(BasePPOConfig):
     """GAT model configuration"""
-    type: str = "gnn"
-    hidden_dim: int = 128
     num_gnn_layers: int = 3
     node_input_dim: int = 3  # x, y, degree
     edge_input_dim: int = 1  # edge_length
@@ -32,7 +30,7 @@ class GNNConfig(BaseModelConfig):
     dropout: float = 0.1
 
 
-class DiscreteGNNPolicy(nn.Module):
+class DiscreteGNNPolicy(BasePolicy):
     """
     Discrete action space GAT policy.
 
@@ -45,10 +43,9 @@ class DiscreteGNNPolicy(nn.Module):
 
     def __init__(
         self,
-        config: GNNConfig = None,
+        config: GNNConfig,
         node_input_dim: int = 3,
         edge_input_dim: int = 2,
-        hidden_dim: int = 128,
         num_gnn_layers: int = 3,
         num_heads: int = 4,
         dropout: float = 0.1,
@@ -56,15 +53,13 @@ class DiscreteGNNPolicy(nn.Module):
     ):
         super().__init__()
 
-        if config is not None:
-            node_input_dim = config.node_input_dim
-            edge_input_dim = config.edge_input_dim
-            hidden_dim = config.hidden_dim
-            num_gnn_layers = config.num_gnn_layers
-            num_heads = config.num_heads
-            dropout = config.dropout
+        node_input_dim = config.node_input_dim
+        edge_input_dim = config.edge_input_dim
+        hidden_dim = config.hidden_dim
+        num_gnn_layers = config.num_gnn_layers
+        num_heads = config.num_heads
+        dropout = config.dropout
 
-        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
 
         # Node feature projection
@@ -85,8 +80,7 @@ class DiscreteGNNPolicy(nn.Module):
                     concat=True,
                     edge_dim=hidden_dim,
                     dropout=dropout,
-                )
-            )
+                ))
 
         # Action head: each node outputs 8 direction logits
         self.action_head = nn.Sequential(
@@ -141,7 +135,9 @@ class DiscreteGNNPolicy(nn.Module):
         # Graph-level pooling
         if batch is None:
             # Single graph: all nodes belong to graph 0
-            batch = torch.zeros(node_features.shape[0], dtype=torch.long, device=node_features.device)
+            batch = torch.zeros(node_features.shape[0],
+                                dtype=torch.long,
+                                device=node_features.device)
         graph_emb = global_mean_pool(node_embs, batch)
 
         return node_embs, graph_emb
@@ -165,7 +161,8 @@ class DiscreteGNNPolicy(nn.Module):
             value: [1]
             node_embs: [num_nodes, hidden_dim]
         """
-        node_embs, graph_emb = self.encode(node_features, edge_index, edge_attr)
+        node_embs, graph_emb = self.encode(node_features, edge_index,
+                                           edge_attr)
 
         # Per-node 8-direction logits: [num_nodes, 8]
         node_action_logits = self.action_head(node_embs)
@@ -199,7 +196,8 @@ class DiscreteGNNPolicy(nn.Module):
             log_prob: action log probability
             value: state value
         """
-        action_logits, value, _ = self.forward(node_features, edge_index, edge_attr)
+        action_logits, value, _ = self.forward(node_features, edge_index,
+                                               edge_attr)
 
         dist = Categorical(logits=action_logits)
 
@@ -211,6 +209,47 @@ class DiscreteGNNPolicy(nn.Module):
         log_prob = dist.log_prob(action)
 
         return action.item(), log_prob, value.squeeze()
+
+    def get_action_batched(
+        self,
+        batch_input,
+        deterministic: bool = False,
+    ):
+        """
+        Sample actions for a PyG Batch of graphs (one graph = one env).
+
+        Args:
+            batch_input: PyG Batch from DiscreteGraphEnv.make_batch_input()
+            deterministic: use argmax instead of sampling
+
+        Returns:
+            actions:   list of int, one per graph
+            log_probs: [batch_size] tensor
+            values:    [batch_size] tensor
+        """
+        node_embs, graph_embs = self.encode(
+            batch_input.x,
+            batch_input.edge_index,
+            batch_input.edge_attr,
+            batch=batch_input.batch,
+        )
+        node_action_logits = self.action_head(node_embs)  # [total_nodes, 8]
+        values = self.value_head(graph_embs).squeeze(-1)  # [batch_size]
+
+        ptr = batch_input.ptr
+        batch_size = batch_input.num_graphs
+        actions, log_probs = [], []
+
+        for i in range(batch_size):
+            start, end = ptr[i].item(), ptr[i + 1].item()
+            logits = node_action_logits[start:end].view(
+                -1)  # [num_nodes_i * 8]
+            dist = Categorical(logits=logits)
+            action = logits.argmax() if deterministic else dist.sample()
+            log_probs.append(dist.log_prob(action))
+            actions.append(action.item())
+
+        return actions, torch.stack(log_probs), values
 
     def evaluate_action(
         self,
@@ -233,7 +272,8 @@ class DiscreteGNNPolicy(nn.Module):
             entropy: distribution entropy
             value: state value
         """
-        action_logits, value, _ = self.forward(node_features, edge_index, edge_attr)
+        action_logits, value, _ = self.forward(node_features, edge_index,
+                                               edge_attr)
 
         dist = Categorical(logits=action_logits)
         log_prob = dist.log_prob(action)
@@ -287,7 +327,8 @@ class DiscreteGNNPolicy(nn.Module):
         for i in range(batch_size):
             # Get this graph's node action logits
             start, end = ptr[i].item(), ptr[i + 1].item()
-            graph_node_logits = node_action_logits[start:end]  # [num_nodes_i, 8]
+            graph_node_logits = node_action_logits[start:
+                                                   end]  # [num_nodes_i, 8]
 
             # Flatten to [num_nodes_i * 8]
             action_logits = graph_node_logits.view(-1)
