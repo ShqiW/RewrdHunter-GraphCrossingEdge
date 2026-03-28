@@ -11,21 +11,9 @@ import networkx as nx
 from pathlib import Path
 from tqdm import tqdm
 from typing import Optional, List
-from dataclasses import dataclass
 
 from torch.utils.data import Dataset
-
-
-@dataclass
-class GraphData:
-    """Data container for a single graph."""
-    edge_index: torch.Tensor        # [2, num_edges]
-    num_nodes: int
-    degree: torch.Tensor            # [num_nodes]
-    graph_distance: torch.Tensor    # [num_nodes, num_nodes]
-    P_graph: torch.Tensor           # [num_nodes, num_nodes]
-    tau: float
-    graph_name: str
+from src.data.data import GraphData
 
 
 class RomeDataset(Dataset):
@@ -67,6 +55,7 @@ class RomeDataset(Dataset):
 
         # Load index
         self.index = self._load_index()
+        self._cache: dict = {}
 
     def _is_processed(self) -> bool:
         """Check if dataset is already processed."""
@@ -79,13 +68,17 @@ class RomeDataset(Dataset):
         return torch.load(index_file)
 
     def _process(self):
+        from src.plot import plot_sequential, build_nx_graph
         """Process all graphs and save to disk."""
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
         processed_names = []
-        print(f"Processing {self.split} dataset ({len(self.graph_files)} graphs)...")
+        print(
+            f"Processing {self.split} dataset ({len(self.graph_files)} graphs)..."
+        )
 
-        for graph_file in tqdm(self.graph_files, desc=f"Processing {self.split}"):
+        for graph_file in tqdm(self.graph_files,
+                               desc=f"Processing {self.split}"):
             # Extract filename
             filename = os.path.basename(graph_file)
             full_path = self.root / "rome" / filename
@@ -93,23 +86,36 @@ class RomeDataset(Dataset):
             if not full_path.exists():
                 continue
 
-            try:
-                data = self._process_single_graph(str(full_path), filename)
-                if data is not None:
-                    # Save to individual file
-                    save_path = self.processed_dir / f"{filename}.pt"
-                    torch.save(data, save_path)
-                    processed_names.append(filename)
-            except Exception as e:
-                print(f"Error processing {filename}: {e}")
+            data = self._process_single_graph(str(full_path), filename)
+            if data is None:
                 continue
+            graphdata = GraphData(**data)
+
+            # plot_path = plot_sequential(
+            #     [{
+            #         "graph": build_nx_graph(graphdata),
+            #         "coords": graphdata.neato_coords.numpy(),
+            #         "graph_name": graphdata.graph_name,
+            #         "best_xing": graphdata.neato_xing,
+            #     }],
+            #     out_dir=self.processed_dir,
+            # )
+            # print(plot_path)
+            # Save to individual file
+            save_path = self.processed_dir / f"{filename}.pt"
+            torch.save(data, save_path)
+            processed_names.append(filename)
 
         # Save index
         index_file = self.processed_dir / "index.pt"
         torch.save(processed_names, index_file)
         print(f"Processed {len(processed_names)} graphs")
 
-    def _process_single_graph(self, graph_path: str, graph_name: str) -> Optional[dict]:
+    def _process_single_graph(
+        self,
+        graph_path: str,
+        graph_name: str,
+    ) -> Optional[dict]:
         """Process a single graph file."""
         # Load graph
         G = nx.read_graphml(graph_path)
@@ -137,13 +143,18 @@ class RomeDataset(Dataset):
             edge_index = torch.zeros((2, 0), dtype=torch.long)
 
         # Node degree
-        degree = torch.tensor([G.degree(i) for i in range(num_nodes)], dtype=torch.float32)
+        degree = torch.tensor([G.degree(i) for i in range(num_nodes)],
+                              dtype=torch.float32)
 
         # Graph distance (shortest path)
         graph_distance = self._compute_graph_distance(G)
 
         # P_graph and tau for softmax ranking
         P_graph, tau = self._compute_softmax_target(graph_distance)
+
+        # Neato layout (raw, unnormalized) — precomputed once for reuse
+        neato_coords = self._compute_neato_coords(G)
+        neato_xing = self._compute_crossings(G, neato_coords)
 
         return {
             "edge_index": edge_index,
@@ -153,20 +164,36 @@ class RomeDataset(Dataset):
             "P_graph": P_graph,
             "tau": tau,
             "graph_name": graph_name,
+            "neato_coords": neato_coords,
+            "neato_xing": neato_xing,
         }
+
+    def _compute_neato_coords(self, G: nx.Graph) -> torch.Tensor:
+        """Compute neato layout and return raw (unnormalized) coordinates."""
+        pos = nx.nx_agraph.graphviz_layout(G, prog="neato")
+        # pos = nx.nx_agraph.graphviz_layout(G, prog="sfdp")
+        n = G.number_of_nodes()
+        coords = torch.tensor(
+            [[pos[v][0], pos[v][1]] for v in range(n)],
+            dtype=torch.float32,
+        )
+        return coords
+
+    def _compute_crossings(self, G: nx.Graph, coords: torch.Tensor) -> int:
+        """Count hard edge crossings for a given layout."""
+        from src.plot import count_hard_crossings
+        return count_hard_crossings(G, coords.numpy(), device="cuda")
 
     def _compute_graph_distance(self, G: nx.Graph) -> torch.Tensor:
         """Compute shortest path distance matrix."""
         n = G.number_of_nodes()
-        nodes = list(G.nodes())
 
         d_graph = torch.zeros((n, n), dtype=torch.float32)
 
-        for i, u in enumerate(nodes):
+        for u in range(n):
             sp_lengths = nx.single_source_shortest_path_length(G, u)
             for v, dist in sp_lengths.items():
-                j = nodes.index(v)
-                d_graph[i, j] = float(dist)
+                d_graph[u, v] = float(dist)
 
         return d_graph
 
@@ -198,10 +225,12 @@ class RomeDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx: int) -> GraphData:
-        """Load a graph by index."""
-        graph_name = self.index[idx]
-        data_path = self.processed_dir / f"{graph_name}.pt"
-        data_dict = torch.load(data_path)
+        """Load a graph by index (cached in memory after first access)."""
+        if idx not in self._cache:
+            graph_name = self.index[idx]
+            data_path = self.processed_dir / f"{graph_name}.pt"
+            self._cache[idx] = torch.load(data_path)
+        data_dict = self._cache[idx]
 
         return GraphData(
             edge_index=data_dict["edge_index"],
@@ -211,11 +240,13 @@ class RomeDataset(Dataset):
             P_graph=data_dict["P_graph"],
             tau=data_dict["tau"],
             graph_name=data_dict["graph_name"],
+            neato_coords=data_dict["neato_coords"],
+            neato_xing=data_dict["neato_xing"],
         )
 
     def sample(self) -> GraphData:
         """Random sample a graph."""
-        idx = torch.randint(0, len(self), (1,)).item()
+        idx = torch.randint(0, len(self), (1, )).item()
         return self[idx]
 
 

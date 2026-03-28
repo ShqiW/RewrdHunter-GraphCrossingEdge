@@ -8,7 +8,7 @@ Can be called two ways:
 - discrete_ppo: before (random init) vs after (PPO refinement)
 - sequential_ppo: final placement produced by the policy
 """
-import argparse
+
 import torch
 import numpy as np
 import networkx as nx
@@ -18,12 +18,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
-from tqdm import tqdm
-
+from typing import List, Dict
+from src.data.data import GraphData
 # ── Graph helpers ──────────────────────────────────────────────────────────────
 
 
-def build_nx_graph(graph_data) -> nx.Graph:
+def build_nx_graph(graph_data: GraphData) -> nx.Graph:
     graph = nx.Graph()
     graph.add_nodes_from(range(graph_data.num_nodes))
     edges = graph_data.edge_index.T[:graph_data.edge_index.shape[1] // 2]
@@ -31,7 +31,11 @@ def build_nx_graph(graph_data) -> nx.Graph:
     return graph
 
 
-def count_hard_crossings(graph: nx.Graph, coords: np.ndarray, device) -> int:
+def count_hard_crossings(
+    graph: nx.Graph,
+    coords: np.ndarray,
+    device,
+) -> int:
     from src.losses.xing import XingLoss
     xing = XingLoss(graph, device, soft=False)
     return int(xing(torch.tensor(coords, dtype=torch.float32)).item())
@@ -68,15 +72,16 @@ def get_crossing_edges(coords: np.ndarray, edges: list) -> set:
 def load_policy_from_path(ckpt_path: str, args, device: str):
     """Load policy weights given an already-built args object."""
     ckpt = torch.load(ckpt_path, map_location=device)
-    model_type = args.model.type
-    if model_type == "gnn":
-        from src.models.gnn import DiscreteGNNPolicy
-        policy = DiscreteGNNPolicy(config=args.model).to(device)
-    elif model_type == "transformer":
-        from src.models.transformer_policy import TransformerPlacementPolicy
-        policy = TransformerPlacementPolicy(config=args.model).to(device)
-    else:
-        raise NotImplementedError(f"Unknown model type: {model_type}")
+    model_type = args.name
+    match model_type:
+        case "discrete_ppo":
+            from src.models.gnn import DiscreteGNNPolicy
+            policy = DiscreteGNNPolicy(config=args.model).to(device)
+        case "sequential_ppo" | "sequential_refinement":
+            from src.models.transformer_policy import TransformerPlacementPolicy
+            policy = TransformerPlacementPolicy(config=args.model).to(device)
+        case _:
+            raise NotImplementedError(f"Unknown model type: {model_type}")
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.eval()
     return policy
@@ -98,7 +103,13 @@ def load_policy(args, device: str):
 # ── Episode runners ────────────────────────────────────────────────────────────
 
 
-def run_episode_discrete(policy, env, graph: nx.Graph, device, seed: int = 42):
+def run_episode_discrete(
+    policy,
+    env,
+    graph: nx.Graph,
+    device,
+    seed: int = 42,
+):
     np.random.seed(seed)
     obs, info = env.reset(seed=seed)
     before_coords = env.get_coords()
@@ -141,8 +152,13 @@ def run_episode_sequential(policy, env, device, seed: int = 42):
 # ── Drawing ────────────────────────────────────────────────────────────────────
 
 
-def draw_graph(ax, coords: np.ndarray, edges: list, crossing_edges: set,
-               title: str):
+def draw_graph(
+    ax,
+    coords: np.ndarray,
+    edges: list,
+    crossing_edges: set,
+    title: str,
+):
     ax.set_aspect("equal")
     margin = 0.05 * (coords.max() - coords.min() + 1e-6)
     ax.set_xlim(coords[:, 0].min() - margin, coords[:, 0].max() + margin)
@@ -181,9 +197,11 @@ def _add_legend(fig):
 # ── Layout refinement ──────────────────────────────────────────────────────────
 
 
-def refine_layout(coords: np.ndarray,
-                  edges: list,
-                  max_iters: int = 300) -> np.ndarray:
+def refine_layout(
+    coords: np.ndarray,
+    edges: list,
+    max_iters: int = 300,
+) -> np.ndarray:
     """
     Post-process a layout by compressing crossing-edge nodes toward the layout
     centroid until the crossing set changes.
@@ -235,88 +253,31 @@ def refine_layout(coords: np.ndarray,
 # ── Core plot functions ────────────────────────────────────────────────────────
 
 
-def _plot_sequential(policy, dataset, args, device, top_n: int, output: Path):
-    from src.envs.sequential import SequentialGraphEnv
-
-    results = []
-    for i in tqdm(range(len(dataset)), desc="Running inference"):
-        graph_data = dataset[i]
-        graph = build_nx_graph(graph_data)
-        env = SequentialGraphEnv(graph_data=graph_data,
-                                 device=device,
-                                 config=args.env)
-        try:
-            coords = run_episode_sequential(policy, env, device)
-            # edges = list(graph.edges())
-            # coords = refine_layout(coords, edges)
-            xing = count_hard_crossings(graph, coords, device)
-            results.append({
-                "graph_name": graph_data.graph_name,
-                "graph": graph,
-                "coords": coords,
-                "crossings": xing,
-            })
-        except Exception as e:
-            print(f"  Skipping {graph_data.graph_name}: {e}")
-
-    results.sort(key=lambda r: r["crossings"])
-    subset = results[:top_n]
-
-    out_dir = output.parent / output.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
+def plot_sequential(subset: list, out_dir: Path):
 
     for r in subset:
         edges = list(r["graph"].edges())
         fig, ax = plt.subplots(figsize=(5, 4.5))
-        draw_graph(ax, r["coords"], edges,
-                   get_crossing_edges(r["coords"], edges),
-                   f"{r['graph_name']}\ncrossings={r['crossings']}")
+        draw_graph(
+            ax,
+            r["coords"],
+            edges,
+            get_crossing_edges(r["coords"], edges),
+            f"{r['graph_name']}\ncrossings={r['best_xing']}",
+        )
         _add_legend(fig)
+        plot_path = out_dir / f"{r['graph_name']}.png"
         plt.tight_layout()
-        plt.savefig(out_dir / f"{r['graph_name']}.png",
-                    dpi=150,
-                    bbox_inches="tight")
+        plt.savefig(
+            plot_path,
+            dpi=150,
+            bbox_inches="tight",
+        )
         plt.close()
-
-    all_xings = [r["crossings"] for r in results]
-    zero_pct = 100 * sum(1 for x in all_xings if x == 0) / len(all_xings)
-    print(f"\nSaved {len(subset)} figures to {out_dir}/")
-    print(f"Full test  — mean: {np.mean(all_xings):.2f}, "
-          f"median: {np.median(all_xings):.1f}, "
-          f"zero: {sum(1 for x in all_xings if x==0)}/{len(all_xings)}, "
-          f"zero-crossing={zero_pct:.1f}%")
+        return plot_path
 
 
-def _plot_discrete(policy, dataset, args, device, top_n: int, output: Path):
-    from src.envs.discrete import DiscreteGraphEnv
-
-    results = []
-    for i in tqdm(range(len(dataset)), desc="Running inference"):
-        graph_data = dataset[i]
-        graph = build_nx_graph(graph_data)
-        env = DiscreteGraphEnv(graph_data=graph_data,
-                               device=device,
-                               config=args.env)
-        try:
-            before, after, init_x, best_x = run_episode_discrete(
-                policy, env, graph, device)
-            results.append({
-                "graph_name": graph_data.graph_name,
-                "graph": graph,
-                "before_coords": before,
-                "after_coords": after,
-                "initial_xing": init_x,
-                "best_xing": best_x,
-                "improvement": init_x - best_x,
-            })
-        except Exception as e:
-            print(f"  Skipping {graph_data.graph_name}: {e}")
-
-    results.sort(key=lambda r: r["improvement"], reverse=True)
-    subset = results[:top_n]
-
-    out_dir = output.parent / output.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
+def plot_discrete(subset: List[Dict], out_dir: Path):
 
     for r in subset:
         edges = list(r["graph"].edges())
@@ -324,17 +285,27 @@ def _plot_discrete(policy, dataset, args, device, top_n: int, output: Path):
         fig.suptitle(
             f"{r['graph_name']} — Before vs After PPO (red = crossing edges)",
             fontsize=10)
-        draw_graph(axes[0], r["before_coords"], edges,
-                   get_crossing_edges(r["before_coords"], edges),
-                   f"before={r['initial_xing']}")
-        draw_graph(axes[1], r["after_coords"], edges,
-                   get_crossing_edges(r["after_coords"], edges),
-                   f"after={r['best_xing']}  Δ={r['improvement']}")
+        draw_graph(
+            axes[0],
+            r["before_coords"],
+            edges,
+            get_crossing_edges(r["before_coords"], edges),
+            f"before={r['initial_xing']}",
+        )
+        draw_graph(
+            axes[1],
+            r["coords"],
+            edges,
+            get_crossing_edges(r["coords"], edges),
+            f"after={r['best_xing']}  Δ={r['improvement']}",
+        )
         _add_legend(fig)
         plt.tight_layout()
-        plt.savefig(out_dir / f"{r['graph_name']}.png",
-                    dpi=150,
-                    bbox_inches="tight")
+        plt.savefig(
+            out_dir / f"{r['graph_name']}.png",
+            dpi=150,
+            bbox_inches="tight",
+        )
         plt.close()
 
     print(f"\nSaved {len(subset)} figures to {out_dir}/")
@@ -410,68 +381,3 @@ def plot_comparison(comparison_csv: str, output_dir: str):
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Comparison scatter saved to {save_path}")
-
-
-# ── Public entry points ────────────────────────────────────────────────────────
-
-
-def plot_layouts(args, top_n: int = 100):
-    """Called from main.py (if_plot=True)."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy = load_policy(args, device)
-
-    from src.data.rome import RomeDataset
-    dataset = RomeDataset(root=args.graph.data_root, split="test")
-    print(f"Test dataset: {len(dataset)} graphs")
-
-    output = Path().cwd() / "visualization.png"
-    if args.env.type == "sequential":
-        _plot_sequential(policy, dataset, args, device, top_n, output)
-    else:
-        _plot_discrete(policy, dataset, args, device, top_n, output)
-
-
-def plot_from_checkpoint(
-    checkpoint_path: str,
-    output_dir: str,
-    data_root: str = None,
-    top_n: int = 20,
-    device: str = None,
-):
-    """
-    Standalone entry — loads everything from the checkpoint.
-
-    Args:
-        checkpoint_path: path to final_model.pt
-        output_dir:      where to save layout_visualization.png
-        data_root:       override data root (default: use value saved in checkpoint)
-        top_n:           how many graphs to show in the figure
-        device:          'cpu' or 'cuda' (default: auto)
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    from src.evaluate import _rebuild_args
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    args = _rebuild_args(ckpt["args"])
-
-    if data_root:
-        args.graph.data_root = data_root
-    args.graph.data_split = "test"
-    args.graph.use_dataset = True
-
-    print(
-        f"Task: {args.name}  |  Model: {args.model.type}  |  Device: {device}")
-    print(f"Data: {args.graph.data_root} / test")
-
-    policy = load_policy_from_path(checkpoint_path, args, device)
-
-    from src.data.rome import RomeDataset
-    dataset = RomeDataset(root=args.graph.data_root, split="test")
-    print(f"Test dataset: {len(dataset)} graphs")
-
-    output = Path(output_dir) / "layout_visualization.png"
-    if args.env.type == "sequential":
-        _plot_sequential(policy, dataset, args, device, top_n, output)
-    else:
-        _plot_discrete(policy, dataset, args, device, top_n, output)

@@ -6,12 +6,26 @@ class XingLoss:
 
     def __init__(self, G: nx.Graph, device, soft=False, sharpness=10.0):
         # Store edges as a long tensor [num_edges, 2]
-        nodes = list(G.nodes())
-        edges = [[nodes.index(i), nodes.index(j)] for i, j in G.edges]
+        # Assumes integer node labels 0..n-1 (after convert_node_labels_to_integers)
+        edges = [[i, j] for i, j in G.edges]
         self.edges = torch.tensor(edges, dtype=torch.long)
         self.device = device
         self.soft = soft
         self.sharpness = sharpness
+
+        # Precompute non-adjacent edge pairs once (graph topology is fixed)
+        num_edges = self.edges.shape[0]
+        if num_edges > 1:
+            idx_i, idx_j = torch.triu_indices(num_edges, num_edges, offset=1)
+            ei = self.edges[idx_i]
+            ej = self.edges[idx_j]
+            no_shared = ~((ei[:, 0] == ej[:, 0]) | (ei[:, 0] == ej[:, 1]) |
+                          (ei[:, 1] == ej[:, 0]) | (ei[:, 1] == ej[:, 1]))
+            self._pairs_i = ei[no_shared]
+            self._pairs_j = ej[no_shared]
+        else:
+            self._pairs_i = torch.zeros((0, 2), dtype=torch.long)
+            self._pairs_j = torch.zeros((0, 2), dtype=torch.long)
 
     @staticmethod
     def cross_2d(v, u):
@@ -39,12 +53,14 @@ class XingLoss:
         val = val * ((x >= 0) & (x <= 1) & (y >= 0) & (y <= 1))
         return val
 
-    def edges_intersect(self,
-                        edge_1_start_pos,
-                        edge_1_end_pos,
-                        edge_2_start_pos,
-                        edge_2_end_pos,
-                        eps=1e-6):
+    def edges_intersect(
+        self,
+        edge_1_start_pos,
+        edge_1_end_pos,
+        edge_2_start_pos,
+        edge_2_end_pos,
+        eps=1e-6,
+    ):
         p = edge_1_start_pos
         q = edge_2_start_pos
         r = edge_1_end_pos - p
@@ -102,28 +118,18 @@ class XingLoss:
         """
         coords: Tensor of shape [num_nodes, >=2], returns scalar total crossings
         """
-        num_edges = self.edges.shape[0]
-        idx_i, idx_j = torch.triu_indices(num_edges, num_edges, offset=1)
-        edge_i = self.edges[idx_i]
-        edge_j = self.edges[idx_j]
-
-        # Remove pairs sharing a node
-        no_shared_nodes = ~((edge_i[:, 0] == edge_j[:, 0]) |
-                            (edge_i[:, 0] == edge_j[:, 1]) |
-                            (edge_i[:, 1] == edge_j[:, 0]) |
-                            (edge_i[:, 1] == edge_j[:, 1]))
-        edge_i = edge_i[no_shared_nodes]
-        edge_j = edge_j[no_shared_nodes]
-
-        if edge_i.shape[0] == 0:
+        if self._pairs_i.shape[0] == 0:
             return torch.tensor(0.0, device=coords.device)
 
-        # Get endpoints
-        edge_1_start_pos = coords[edge_i[:, 0], :2]
-        edge_1_end_pos = coords[edge_i[:, 1], :2]
-        edge_2_start_pos = coords[edge_j[:, 0], :2]
-        edge_2_end_pos = coords[edge_j[:, 1], :2]
+        edge_1_start_pos = coords[self._pairs_i[:, 0], :2]
+        edge_1_end_pos   = coords[self._pairs_i[:, 1], :2]
+        edge_2_start_pos = coords[self._pairs_j[:, 0], :2]
+        edge_2_end_pos   = coords[self._pairs_j[:, 1], :2]
 
-        crossings = self.edges_intersect(edge_1_start_pos, edge_1_end_pos,
-                                         edge_2_start_pos, edge_2_end_pos)
+        crossings = self.edges_intersect(
+            edge_1_start_pos,
+            edge_1_end_pos,
+            edge_2_start_pos,
+            edge_2_end_pos,
+        )
         return crossings.sum().float()

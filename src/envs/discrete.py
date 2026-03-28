@@ -11,15 +11,18 @@ State Space (GAT features):
 """
 from dataclasses import dataclass
 from typing import Optional
-import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import networkx as nx
 import torch
 
+from torch_geometric.data import Data, Batch
+
 from src.tasks.base import BaseEnvConfig
 from src.losses.xing import XingLoss
-
+from src.envs.base import BaseGraphEnv
+from src.data.data import GraphData
+from src.envs.utils import get_initial_layout
 # 8 direction unit vectors
 DIRECTIONS = np.array(
     [
@@ -43,15 +46,10 @@ NUM_DIRECTIONS = 8
 @dataclass
 class DiscreteEnvConfig(BaseEnvConfig):
     """Discrete environment configuration"""
-    type: str = "discrete"
 
     # Reward weights (R = w1 * ΔR_cross + w2 * ΔR_structure)
     crossing_weight: float = 1.0
-<<<<<<< HEAD
-    structure_weight: float = 0.1
-=======
     structure_weight: float = 0.3
->>>>>>> f67fc63 (sync)
 
     # Structure consistency method: "stress" | "rank" | "softmax"
     structure_method: str = "softmax"
@@ -59,13 +57,13 @@ class DiscreteEnvConfig(BaseEnvConfig):
     # Method-specific parameters
     softmax_tau: Optional[float] = 1  # None = adaptive mean(d_graph)
 
-    use_potential_shaping: bool = True
+    use_potential_shaping: bool = False
 
     # Crossing computation
-    soft_crossing: bool = True
+    soft_crossing: bool = False
 
 
-class DiscreteGraphEnv(gym.Env):
+class DiscreteGraphEnv(BaseGraphEnv):
     """
     Discrete action space graph layout environment.
 
@@ -77,7 +75,7 @@ class DiscreteGraphEnv(gym.Env):
         self,
         # graph: nx.Graph,
         # graph_path: str,
-        graph_data,  # GraphData from RomeDataset
+        graph_data: GraphData,
         device: torch.cuda.device,
         config: DiscreteEnvConfig,
     ):
@@ -92,33 +90,19 @@ class DiscreteGraphEnv(gym.Env):
         self.device = device
 
         # Load graph from various sources
-        if graph_data is not None:
-            # From RomeDataset GraphData
-            self.num_nodes = graph_data.num_nodes
-            self.edge_index = graph_data.edge_index.numpy()
-            self.graph_name = graph_data.graph_name
+        # From RomeDataset GraphData
+        self.num_nodes = graph_data.num_nodes
+        self.edge_index = graph_data.edge_index.numpy()
+        self.graph_name = graph_data.graph_name
+        # Precomputed neato coords (raw, unnormalized); None if not available
+        self.neato_coords = graph_data.neato_coords.numpy()
 
-            # Build nx.Graph for XingLoss
-            self.graph = nx.Graph()
-            self.graph.add_nodes_from(range(self.num_nodes))
-            edges = self.edge_index.T[:self.edge_index.shape[1] //
-                                      2]  # Remove duplicates
-            self.graph.add_edges_from(edges.tolist())
-
-        elif graph is not None:
-            self.graph = graph
-            self.num_nodes = self.graph.number_of_nodes()
-            self.graph_name = None
-
-        elif graph_path is not None:
-            self.graph = nx.read_graphml(graph_path)
-            self.graph = nx.convert_node_labels_to_integers(self.graph,
-                                                            ordering="sorted")
-            self.num_nodes = self.graph.number_of_nodes()
-            self.graph_name = graph_path
-
-        else:
-            raise ValueError("Must provide graph, graph_path, or graph_data")
+        # Build nx.Graph for XingLoss
+        self.graph = nx.Graph()
+        self.graph.add_nodes_from(range(self.num_nodes))
+        edges = self.edge_index.T[:self.edge_index.shape[1] //
+                                  2]  # Remove duplicates
+        self.graph.add_edges_from(edges.tolist())
 
         self.num_edges = self.graph.number_of_edges()
 
@@ -174,18 +158,22 @@ class DiscreteGraphEnv(gym.Env):
             case "softmax":
                 from src.losses.softmax_ranking import SoftmaxRankingLoss
                 self.structure_loss = SoftmaxRankingLoss(
-                    G=self.graph, device=device, tau=config.softmax_tau)
+                    P_graph=graph_data.P_graph,
+                    tau=graph_data.tau,
+                    device=device,
+                )
             case _:
                 raise ValueError(
                     f"Unknown structure method: {config.structure_method}")
 
         # State variables
-        self.coords = None
-        self.current_crossings = None
-        self.current_structure = None
-        self.best_crossings = None
+        self.coords: np.ndarray
+        self.current_crossings: float
+        self.current_structure: float
+        self.best_crossings: float
         self.steps = 0
         self.no_improve_steps = 0
+        self.reset()
 
     def _decode_action(self, action: int):
         """Decode action: action -> (node_id, direction_id)"""
@@ -228,9 +216,10 @@ class DiscreteGraphEnv(gym.Env):
         Get node features: [x, y, degree]
         Shape: [num_nodes, 3]
         """
-        features = np.column_stack([coords,
-                                    self.degree.reshape(-1,
-                                                        1)]).astype(np.float32)
+        features = np.column_stack([
+            coords,
+            self.degree.reshape(-1, 1),
+        ]).astype(np.float32)
         return features
 
     def _get_edge_features(self, coords: np.ndarray) -> np.ndarray:
@@ -246,31 +235,19 @@ class DiscreteGraphEnv(gym.Env):
         return edge_lengths.reshape(-1, 1).astype(np.float32)
 
     def _get_initial_layout(self) -> np.ndarray:
-        if self.initial_layout == "random":
-            coords = np.random.rand(self.num_nodes, 2).astype(np.float32)
-        elif self.initial_layout == "neato":
-            pos = nx.nx_agraph.graphviz_layout(self.graph, prog="neato")
-            coords = np.array([[pos[v][0], pos[v][1]]
-                               for v in self.graph.nodes()],
-                              dtype=np.float32)
-        elif self.initial_layout == "sfdp":
-            pos = nx.nx_agraph.graphviz_layout(self.graph, prog="sfdp")
-            coords = np.array([[pos[v][0], pos[v][1]]
-                               for v in self.graph.nodes()],
-                              dtype=np.float32)
-        else:
-            pos = nx.spring_layout(self.graph)
-            coords = np.array([[pos[v][0], pos[v][1]]
-                               for v in self.graph.nodes()],
-                              dtype=np.float32)
-
-        return self._normalize_coords(coords)
+        return self._normalize_coords(
+            get_initial_layout(
+                self.initial_layout,
+                self.num_nodes,
+                self.neato_coords,
+                self.graph,
+            ))
 
     def _normalize_coords(self, coords: np.ndarray) -> np.ndarray:
         min_coords = coords.min(axis=0)
-        max_coords = coords.max(axis=0)
-        scale = max_coords - min_coords
-        scale[scale == 0] = 1.0
+        scale = (coords.max(axis=0) - min_coords).max()
+        if scale == 0:
+            scale = 1.0
         return (coords - min_coords) / scale
 
     def reset(self, seed=None, options=None):
@@ -279,7 +256,7 @@ class DiscreteGraphEnv(gym.Env):
         self.coords = self._get_initial_layout()
         self.current_crossings = self._compute_crossings(self.coords)
         self.current_structure = self._compute_structure(self.coords)
-        self.current_potential = self._compute_potential(self.coords)
+        self.current_potential = -(self.current_crossings + self.structure_weight * self.current_structure)
 
         self.initial_crossings = self.current_crossings
         self.initial_structure = self.current_structure
@@ -320,7 +297,7 @@ class DiscreteGraphEnv(gym.Env):
         # Compute new state
         new_crossings = self._compute_crossings(self.coords)
         new_structure = self._compute_structure(self.coords)
-        new_potential = self._compute_potential(self.coords)
+        new_potential = -(new_crossings + self.structure_weight * new_structure)
 
         # Compute reward: R = w1 * ΔR_cross + w2 * ΔR_structure
         crossing_reward = self.current_crossings - new_crossings
@@ -351,7 +328,7 @@ class DiscreteGraphEnv(gym.Env):
 
         # Termination
         terminated = False
-        truncated = False
+        truncated = self.steps >= self.config.max_steps
 
         if self.current_crossings == 0:
             terminated = True
@@ -389,3 +366,32 @@ class DiscreteGraphEnv(gym.Env):
     def get_coords(self) -> np.ndarray:
         """Return current coordinates"""
         return self.coords.copy()
+
+    # ── Policy-input interface ─────────────────────────────────────────────────
+
+    def get_policy_input(self, obs: np.ndarray, device) -> tuple:
+        """Return (node_features, edge_index, edge_attr) for policy.get_action."""
+        node_features = torch.tensor(obs, dtype=torch.float32, device=device)
+        gd = self.get_graph_data()
+        return node_features, gd["edge_index"].to(device), gd["edge_attr"].to(
+            device)
+
+    @staticmethod
+    def make_batch_input(envs, obs_list, device):
+        """
+        Build a PyG Batch from a list of envs and their current observations.
+        Used by policy.get_action_batched(batch_input) during rollout.
+        """
+        data_list = []
+        for env, obs in zip(envs, obs_list):
+            node_features = torch.tensor(obs,
+                                         dtype=torch.float32,
+                                         device=device)
+            gd = env.get_graph_data()
+            data_list.append(
+                Data(
+                    x=node_features,
+                    edge_index=gd["edge_index"].to(device),
+                    edge_attr=gd["edge_attr"].to(device),
+                ))
+        return Batch.from_data_list(data_list)

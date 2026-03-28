@@ -16,11 +16,12 @@ from typing import Optional
 import numpy as np
 import networkx as nx
 import torch
-import gymnasium as gym
 from gymnasium import spaces
 
 from src.tasks.base import BaseEnvConfig
-
+from src.envs.base import BaseGraphEnv
+from src.data.rome import GraphData
+from src.envs.utils import get_initial_layout
 # Acceleration priority: Cython compiled > Numba JIT > pure numpy (defined below)
 try:
     from src.envs._crossing import segments_intersect_batch as _fast_intersect
@@ -42,10 +43,7 @@ except ImportError:
 @dataclass
 class SequentialEnvConfig(BaseEnvConfig):
     """Sequential placement environment configuration"""
-    type: str = "sequential"
     structure_weight: float = 0.3
-    collapse_alpha: float = 10.0  # max penalty when nodes overlap
-    collapse_beta: float = 0.05  # decay scale (in [0,1]² coordinate space)
     normalize_coords: bool = False  # re-normalize placed coords to [-1,1]² after each step
     # Node ordering strategy:
     #   "bfs"          — BFS from random start (default)
@@ -56,6 +54,13 @@ class SequentialEnvConfig(BaseEnvConfig):
     #   "degree_sample"— sample without replacement; P(v) ∝ softmax(degree)
     order_method: str = "bfs"
     rotate_augment: bool = False  # randomly rotate all placed coords after each step
+    # Initial layout for refinement mode:
+    #   "none"   — place from scratch (default)
+    #   "neato"  — start from graphviz neato layout, action = delta offset
+    #   "sfdp"   — start from graphviz sfdp layout
+    #   "spring" — start from networkx spring layout
+    # initial_layout: str = "none"
+    delta_scale: float = 0.1  # max offset per step in [-1,1]² space (only used when initial_layout != "none")
 
 
 def _segments_intersect_batch(
@@ -136,7 +141,7 @@ def _segments_intersect_batch_dispatch(p1, p2, p3s, p4s, eps=1e-6):
     return _segments_intersect_batch(p1, p2, p3s, p4s, eps)
 
 
-class SequentialGraphEnv(gym.Env):
+class SequentialGraphEnv(BaseGraphEnv):
     """
     Sequential node placement environment.
 
@@ -152,7 +157,7 @@ class SequentialGraphEnv(gym.Env):
 
     def __init__(
         self,
-        graph_data,
+        graph_data: GraphData,
         device,
         config: SequentialEnvConfig,
     ):
@@ -161,12 +166,11 @@ class SequentialGraphEnv(gym.Env):
         self.config = config
         self.device = device
         self.structure_weight = config.structure_weight
-        self.collapse_alpha = config.collapse_alpha
-        self.collapse_beta = config.collapse_beta
         self.normalize_coords = config.normalize_coords
         self.order_method = config.order_method
         self.rotate_augment = config.rotate_augment
 
+        self.neato_coords = graph_data.neato_coords.numpy()
         # Build graph from GraphData
         self.num_nodes = graph_data.num_nodes
         self.graph_name = graph_data.graph_name
@@ -196,18 +200,23 @@ class SequentialGraphEnv(gym.Env):
         self._nx_graph.add_edges_from(self.undirected_edges)
 
         # Gymnasium spaces
-        self.action_space = spaces.Box(low=-1.0,
-                                       high=1.0,
-                                       shape=(2, ),
-                                       dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(2, ),
+            dtype=np.float32,
+        )
         # Variable-size obs; gymnasium needs a fixed shape declaration.
         # Actual obs tensors are variable; trainers should use get_obs_tensors().
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.num_nodes, 3),
+            shape=(self.num_nodes, 4),
             dtype=np.float32,
         )
+
+        self.initial_layout = config.initial_layout
+        self.delta_scale = config.delta_scale
 
         # Episode state (initialised in reset)
         self.coords: Optional[np.ndarray] = None  # [num_nodes, 2]
@@ -222,6 +231,20 @@ class SequentialGraphEnv(gym.Env):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_initial_layout(self) -> np.ndarray:
+        coords = get_initial_layout(
+            self.initial_layout,
+            self.num_nodes,
+            self.neato_coords,
+            self._nx_graph,
+        )
+
+        # Normalize to [-1, 1]²
+        lo, hi = coords.min(axis=0), coords.max(axis=0)
+        scale = hi - lo
+        scale[scale == 0] = 1.0
+        return (2.0 * (coords - lo) / scale - 1.0).astype(np.float32)
 
     def _compute_node_order(self) -> list:
         """Compute node placement order according to self.order_method."""
@@ -338,46 +361,19 @@ class SequentialGraphEnv(gym.Env):
         """
         num_placed = len(self.placed_nodes_list)
         if num_placed == 0:
-            return np.zeros((0, 3), dtype=np.float32), []
+            return np.zeros((0, 4), dtype=np.float32), []
 
         vt = self.bfs_order[self.step_idx]
         placed_neighbors = set(u for u in self.adj[vt] if u in self.placed_set)
 
-        features = np.zeros((num_placed, 3), dtype=np.float32)
+        features = np.zeros((num_placed, 4), dtype=np.float32)
         for i, node in enumerate(self.placed_nodes_list):
             features[i, 0] = self.coords[node, 0]
             features[i, 1] = self.coords[node, 1]
-            features[i, 2] = 1.0 if node in placed_neighbors else 0.0
+            features[i, 2] = 1.0 if node == vt else 0.0
+            features[i, 3] = 1.0 if node in placed_neighbors else 0.0
 
         return features, list(self.placed_nodes_list)
-
-    def _compute_structure_kl(self, placed_indices: list) -> float:
-        """KL(P_graph_sub || P_layout_sub) over the placed subgraph."""
-        k = len(placed_indices)
-        if k < 2:
-            return 0.0
-
-        idx = np.array(placed_indices)
-
-        d_graph_sub = self.graph_distance[np.ix_(idx, idx)]  # [k, k]
-        coords_sub = self.coords[idx]  # [k, 2]
-        diff = coords_sub[:, None, :] - coords_sub[None, :, :]  # [k, k, 2]
-        d_layout_sub = np.sqrt((diff**2).sum(axis=-1) + 1e-8)  # [k, k]
-
-        def _softmax_masked(d):
-            logits = -d / self.tau
-            np.fill_diagonal(logits, -1e9)
-            logits -= logits.max(axis=1, keepdims=True)
-            e = np.exp(logits)
-            return e / e.sum(axis=1, keepdims=True)
-
-        P_graph = _softmax_masked(d_graph_sub)
-        P_layout = _softmax_masked(d_layout_sub)
-
-        eps = 1e-8
-        kl = (P_graph * (np.log(P_graph + eps) - np.log(P_layout + eps))).sum(
-            axis=1).mean()
-        return float(kl)
 
     def _compute_structure_stress(self, placed_indices: list) -> float:
         """Normalized stress over the placed subgraph.
@@ -437,7 +433,10 @@ class SequentialGraphEnv(gym.Env):
         super().reset(seed=seed)
 
         self.bfs_order = self._compute_node_order()
-        self.coords = np.zeros((self.num_nodes, 2), dtype=np.float32)
+        if self.initial_layout != "none":
+            self.coords = self._get_initial_layout()
+        else:
+            self.coords = np.zeros((self.num_nodes, 2), dtype=np.float32)
         self.placed_set = set()
         self.placed_nodes_list = []
         self.placed_edges = []
@@ -459,7 +458,7 @@ class SequentialGraphEnv(gym.Env):
             self.step_idx = 1
 
         # Obs is empty: no nodes placed yet (or only anchor placed)
-        node_features = np.zeros((0, 3), dtype=np.float32)
+        node_features = np.zeros((0, 4), dtype=np.float32)
         edge_index = np.zeros((2, 0), dtype=np.int64)
 
         next_step = self.step_idx
@@ -478,18 +477,16 @@ class SequentialGraphEnv(gym.Env):
         assert self.step_idx < self.num_nodes, "Episode already finished"
 
         vt = self.bfs_order[self.step_idx]
-        pos = np.clip(action, -1.0, 1.0).astype(np.float32)
+        if self.initial_layout != "none":
+            pos = np.clip(self.coords[vt] + action * self.delta_scale, -1.0,
+                          1.0).astype(np.float32)
+        else:
+            pos = np.clip(action, -1.0, 1.0).astype(np.float32)
 
         # Crossing penalty
         new_crossings = self._count_new_crossings(vt, pos)
         self.total_crossings += new_crossings
         reward = -float(new_crossings)
-
-        # Collapse penalty: α * exp(-d_min / β)
-        if False and self.placed_nodes_list:
-            prev_coords = self.coords[self.placed_nodes_list]
-            d_min = float(np.sqrt(((prev_coords - pos)**2).sum(axis=1)).min())
-            reward -= self.collapse_alpha * np.exp(-d_min / self.collapse_beta)
 
         # Place node
         self.coords[vt] = pos
@@ -538,11 +535,11 @@ class SequentialGraphEnv(gym.Env):
             reward -= self.structure_weight * delta_stress
 
         self.step_idx += 1
-        terminated = (self.step_idx == self.num_nodes)
-        truncated = False
+        terminated = (self.step_idx >= self.num_nodes)
+        truncated = self.step_idx >= self.config.max_steps
 
         if terminated:
-            node_features = np.zeros((0, 3), dtype=np.float32)
+            node_features = np.zeros((0, 4), dtype=np.float32)
             edge_index = np.zeros((2, 0), dtype=np.int64)
             placed_nodes = []
         else:
@@ -564,7 +561,7 @@ class SequentialGraphEnv(gym.Env):
         """Return current state tensors (used by trainer to feed policy)."""
         if not self.placed_nodes_list or self.step_idx >= self.num_nodes:
             return {
-                "node_features": np.zeros((0, 3), dtype=np.float32),
+                "node_features": np.zeros((0, 4), dtype=np.float32),
                 "edge_index": np.zeros((2, 0), dtype=np.int64),
                 "placed_nodes": [],
             }
@@ -579,5 +576,19 @@ class SequentialGraphEnv(gym.Env):
     def get_coords(self) -> np.ndarray:
         return self.coords.copy()
 
-    def get_total_crossings(self) -> int:
-        return self.total_crossings
+    # ── Policy-input interface ─────────────────────────────────────────────────
+
+    def get_policy_input(self, obs: np.ndarray, device) -> tuple:
+        """Return (node_features_tensor,) for policy.get_action."""
+        return (torch.tensor(obs, dtype=torch.float32, device=device), )
+
+    @staticmethod
+    def make_batch_input(envs, obs_list, device):
+        """
+        Build a list of node-feature tensors from current observations.
+        Used by policy.get_action_batched(batch_input) during rollout.
+        """
+        return [
+            torch.tensor(obs, dtype=torch.float32, device=device)
+            for obs in obs_list
+        ]

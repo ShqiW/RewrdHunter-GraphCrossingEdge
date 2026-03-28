@@ -20,14 +20,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from src.tasks.base import BaseModelConfig
+from src.models.base import BasePolicy
+from src.tasks.base import BasePPOConfig
 
 
 @dataclass
-class TransformerConfig(BaseModelConfig):
+class TransformerConfig(BasePPOConfig):
     """Transformer placement policy configuration"""
-    type: str = "transformer"
-    hidden_dim: int = 128
     num_heads: int = 4
     num_encoder_layers: int = 3
     dropout: float = 0.1
@@ -35,7 +34,7 @@ class TransformerConfig(BaseModelConfig):
     log_sigma_max: float = 0.0  # sigma ∈ (exp(-4), 1) ≈ (0.018, 1.0)
 
 
-class TransformerPlacementPolicy(nn.Module):
+class TransformerPlacementPolicy(BasePolicy):
     """
     Actor-critic policy for sequential node placement.
 
@@ -59,7 +58,8 @@ class TransformerPlacementPolicy(nn.Module):
         self.log_sigma_max = config.log_sigma_max
 
         # Shared node feature projection (used by both paths)
-        self.input_proj = nn.Linear(3, d)
+        # Feature layout: (x, y, is_vt, is_neighbor_of_vt)
+        self.input_proj = nn.Linear(4, d)
 
         # Neighbor-only Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -88,7 +88,7 @@ class TransformerPlacementPolicy(nn.Module):
             nn.Linear(d, d),
             nn.ReLU(),
             nn.Linear(d, 2),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
         self.actor_log_sigma = nn.Sequential(
             nn.Linear(d, d),
@@ -107,8 +107,10 @@ class TransformerPlacementPolicy(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _encode_and_pool(self,
-                         batch_feats: List[torch.Tensor]) -> torch.Tensor:
+    def _encode_and_pool(
+        self,
+        batch_feats: List[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Pad a batch of variable-size feature tensors, run through the Transformer
         encoder, and return mean-pooled embeddings.
@@ -130,7 +132,7 @@ class TransformerPlacementPolicy(nn.Module):
             # All sequences empty — return null token for every item
             return self.null_token.unsqueeze(0).expand(B, d).clone()
 
-        padded = torch.zeros(B, max_n, 3, device=device)
+        padded = torch.zeros(B, max_n, batch_feats[0].shape[-1], device=device)
         mask = torch.ones(B, max_n, dtype=torch.bool,
                           device=device)  # True=padding
         for i, (feats, sz) in enumerate(zip(batch_feats, sizes)):
@@ -194,11 +196,12 @@ class TransformerPlacementPolicy(nn.Module):
         nb_feats: List[torch.Tensor] = []
         for feats in batch_features:
             if feats.shape[0] > 0:
-                nb_mask = feats[:, 2] > 0.5
-                nb_feats.append(feats[nb_mask] if nb_mask.any() else torch.
-                                zeros(0, 3, device=device))
+                nb_mask = feats[:, 3] > 0.5  # col 3: is_neighbor_of_vt
+                nb_feats.append(
+                    feats[nb_mask]
+                    if nb_mask.any() else torch.zeros(0, 4, device=device), )
             else:
-                nb_feats.append(torch.zeros(0, 3, device=device))
+                nb_feats.append(torch.zeros(0, 4, device=device))
 
         nb_ctx = self._encode_and_pool(nb_feats)  # [B, d]
 
@@ -233,9 +236,11 @@ class TransformerPlacementPolicy(nn.Module):
     # Inference helpers
     # ------------------------------------------------------------------
 
-    def get_action(self,
-                   node_features: torch.Tensor,
-                   deterministic: bool = False):
+    def get_action(
+        self,
+        node_features: torch.Tensor,
+        deterministic: bool = False,
+    ):
         with torch.no_grad():
             mu, sigma, value = self.forward([node_features])
             mu, sigma, value = mu[0], sigma[0], value[0]
@@ -246,20 +251,21 @@ class TransformerPlacementPolicy(nn.Module):
                 dist = Normal(mu, sigma)
                 action_t = dist.sample()
                 log_prob = dist.log_prob(action_t).sum()
-        return action_t.clamp(0.0, 1.0).cpu().numpy(), log_prob, value
+        return action_t.clamp(-1.0, 1.0).cpu().numpy(), log_prob, value
 
-    def get_action_batched(self,
-                           batch_obs: List[torch.Tensor],
-                           deterministic: bool = False):
+    def get_action_batched(
+        self,
+        batch_obs: List[torch.Tensor],
+        deterministic: bool = False,
+    ):
         mu, sigma, value = self.forward(batch_obs)
+        dist = Normal(mu, sigma)
         if deterministic:
             actions_t = mu
-            log_probs = Normal(mu, sigma).log_prob(actions_t).sum(dim=-1)
         else:
-            dist = Normal(mu, sigma)
             actions_t = dist.sample()
-            log_probs = dist.log_prob(actions_t).sum(dim=-1)
-        actions_t = actions_t.clamp(0.0, 1.0)
+        actions_t = actions_t.clamp(-1.0, 1.0)
+        log_probs = dist.log_prob(actions_t).sum(dim=-1)
         actions = [actions_t[i].cpu().numpy() for i in range(len(batch_obs))]
         return actions, log_probs, value
 
@@ -267,7 +273,7 @@ class TransformerPlacementPolicy(nn.Module):
     # PPO evaluation — fast path with pre-padded tensors
     # ------------------------------------------------------------------
 
-    def evaluate_action_prepadded(
+    def evaluate_action_batched(
         self,
         padded: torch.Tensor,
         mask: torch.Tensor,
@@ -291,46 +297,51 @@ class TransformerPlacementPolicy(nn.Module):
         valid = ~mask  # [B, max_n]
 
         # ── Single projection for both paths ──────────────────────────────────
-        x_all = self.input_proj(padded)   # [B, max_n, d]  (called only once)
+        x_all = self.input_proj(padded)  # [B, max_n, d]  (called only once)
 
         # ── Global summary (vectorised) ────────────────────────────────────────
-        w_all      = valid.float().unsqueeze(-1)                       # [B, max_n, 1]
-        global_ctx = (x_all * w_all).sum(1) / w_all.sum(1).clamp(min=1)  # [B, d]
-        no_nodes   = (~valid).all(1)
+        w_all = valid.float().unsqueeze(-1)  # [B, max_n, 1]
+        global_ctx = (x_all * w_all).sum(1) / w_all.sum(1).clamp(
+            min=1)  # [B, d]
+        no_nodes = (~valid).all(1)
         if no_nodes.any():
             global_ctx = global_ctx.clone()
             global_ctx[no_nodes] = self.null_token
 
         # ── Neighbor Transformer (fully vectorised, no Python loop) ───────────
-        nb_flag   = valid & (padded[:, :, 2] > 0.5)   # [B, max_n]
-        nb_counts = nb_flag.sum(1)                     # [B]
-        max_deg   = int(nb_counts.max().item()) if nb_counts.max() > 0 else 0
+        nb_flag = valid & (padded[:, :, 3] > 0.5
+                           )  # [B, max_n] — col 3: is_neighbor_of_vt
+        nb_counts = nb_flag.sum(1)  # [B]
+        max_deg = int(nb_counts.max().item()) if nb_counts.max() > 0 else 0
 
         if max_deg == 0:
             nb_ctx = self.null_token.unsqueeze(0).expand(B, d).clone()
         else:
             # Sort each row so neighbor positions come first, then gather
             # projected embeddings — no Python loop, no second input_proj call.
-            sort_idx = nb_flag.long().argsort(dim=1, descending=True)   # [B, max_n]
-            nb_x = torch.gather(
-                x_all, 1,
-                sort_idx[:, :max_deg].unsqueeze(-1).expand(-1, -1, d)
-            )  # [B, max_deg, d]
+            sort_idx = nb_flag.long().argsort(dim=1,
+                                              descending=True)  # [B, max_n]
+            nb_x = torch.gather(x_all, 1,
+                                sort_idx[:, :max_deg].unsqueeze(-1).expand(
+                                    -1, -1, d))  # [B, max_deg, d]
 
             # Mask: positions ≥ nb_counts[i] are padding
-            row_idx = torch.arange(max_deg, device=device).unsqueeze(0)  # [1, max_deg]
-            nb_mask = row_idx >= nb_counts.unsqueeze(1)                   # [B, max_deg]
+            row_idx = torch.arange(max_deg,
+                                   device=device).unsqueeze(0)  # [1, max_deg]
+            nb_mask = row_idx >= nb_counts.unsqueeze(1)  # [B, max_deg]
 
             all_empty = nb_mask.all(1)
             if all_empty.any():
-                nb_x    = nb_x.clone()
+                nb_x = nb_x.clone()
                 nb_mask = nb_mask.clone()
-                nb_x[all_empty, 0]    = self.null_token.unsqueeze(0).expand(int(all_empty.sum()), -1)
+                nb_x[all_empty, 0] = self.null_token.unsqueeze(0).expand(
+                    int(all_empty.sum()), -1)
                 nb_mask[all_empty, 0] = False
 
-            nb_embs = self.encoder(nb_x, src_key_padding_mask=nb_mask)  # [B, max_deg, d]
-            w_nb    = (~nb_mask).float().unsqueeze(-1)
-            nb_ctx  = (nb_embs * w_nb).sum(1) / w_nb.sum(1).clamp(min=1)
+            nb_embs = self.encoder(
+                nb_x, src_key_padding_mask=nb_mask)  # [B, max_deg, d]
+            w_nb = (~nb_mask).float().unsqueeze(-1)
+            nb_ctx = (nb_embs * w_nb).sum(1) / w_nb.sum(1).clamp(min=1)
             if all_empty.any():
                 nb_ctx = nb_ctx.clone()
                 nb_ctx[all_empty] = self.null_token
@@ -346,19 +357,4 @@ class TransformerPlacementPolicy(nn.Module):
         dist = Normal(mu, sigma)
         log_probs = dist.log_prob(batch_actions).sum(-1)
         entropies = dist.entropy().sum(-1)
-        return log_probs, entropies, value
-
-    # ------------------------------------------------------------------
-    # PPO evaluation — list-based interface (calls forward)
-    # ------------------------------------------------------------------
-
-    def evaluate_action_batched(
-        self,
-        batch_features: List[torch.Tensor],
-        batch_actions: torch.Tensor,
-    ):
-        mu, sigma, value = self.forward(batch_features)
-        dist = Normal(mu, sigma)
-        log_probs = dist.log_prob(batch_actions).sum(dim=-1)
-        entropies = dist.entropy().sum(dim=-1)
         return log_probs, entropies, value
