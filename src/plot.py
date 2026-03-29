@@ -23,6 +23,67 @@ from src.data.data import GraphData
 # ── Graph helpers ──────────────────────────────────────────────────────────────
 
 
+def render_gif(
+        frames: List[np.ndarray],
+        graph: nx.Graph,
+        output_path: str,
+        crossings: List[float],
+        rewards: List[float],
+        fps: int = 10,
+        figsize: tuple = (5, 5),
+) -> None:
+    """
+    Render a list of coordinate snapshots as an animated GIF.
+
+    Args:
+        frames:      List of [N, 2] float32 coord arrays (one per step).
+        graph:       NetworkX graph (for drawing edges).
+        output_path: Where to write the .gif file.
+        fps:         Frames per second.
+        figsize:     Matplotlib figure size.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+
+    edges = list(graph.edges())
+    fig, ax = plt.subplots(figsize=figsize)
+
+    def _draw(coords: np.ndarray):
+        ax.clear()
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        for u, v in edges:
+            ax.plot(
+                [coords[u, 0], coords[v, 0]],
+                [coords[u, 1], coords[v, 1]],
+                color="steelblue",
+                linewidth=0.8,
+                alpha=0.7,
+            )
+        ax.scatter(coords[:, 0], coords[:, 1], s=20, color="tomato", zorder=3)
+
+    def _update(frame_idx):
+        _draw(frames[frame_idx])
+        ax.set_title(
+            f"step {frame_idx}/{len(frames)-1} {crossings[frame_idx]:.2f} (reward: {rewards[frame_idx]:.2f}/{rewards[-1]:.2f})",
+            fontsize=8,
+        )
+
+    ani = animation.FuncAnimation(
+        fig,
+        _update,
+        frames=len(frames),
+        interval=1000 // fps,
+        repeat=False,
+    )
+    ani.save(output_path, writer="pillow", fps=fps)
+    plt.close(fig)
+
+
 def build_nx_graph(graph_data: GraphData) -> nx.Graph:
     graph = nx.Graph()
     graph.add_nodes_from(range(graph_data.num_nodes))
@@ -36,9 +97,13 @@ def count_hard_crossings(
     coords: np.ndarray,
     device,
 ) -> int:
-    from src.losses.xing import XingLoss
-    xing = XingLoss(graph, device, soft=False)
-    return int(xing(torch.tensor(coords, dtype=torch.float32)).item())
+    from src.envs._crossing_all import find_all_crossings
+    edges = np.array(list(graph.edges()), dtype=np.int64)
+    if len(edges) == 0:
+        return 0
+    positions = np.asarray(coords, dtype=np.float64)
+    count, _ = find_all_crossings(positions, edges)
+    return count
 
 
 def segments_intersect(p1, p2, p3, p4) -> bool:
@@ -294,10 +359,10 @@ def plot_discrete(subset: List[Dict], out_dir: Path):
         )
         draw_graph(
             axes[1],
-            r["coords"],
+            r["frames"][-1],
             edges,
-            get_crossing_edges(r["coords"], edges),
-            f"after={r['best_xing']}  Δ={r['improvement']}",
+            get_crossing_edges(r["frames"][-1], edges),
+            f"after={r['crossings'][-1]}  Δ={r['improvement']}",
         )
         _add_legend(fig)
         plt.tight_layout()

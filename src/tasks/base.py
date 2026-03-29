@@ -13,6 +13,10 @@ class BaseEnvConfig:
     move_scale: float = 0.05
     initial_layout: str = "neato"  # random, neato, sfdp, spring
     max_steps: int = 128
+    # Static-action early termination: if the actual per-node displacement after
+    # clipping falls below this threshold the state cannot change, so the episode
+    # is truncated immediately.  Set to 0 to disable.
+    min_effective_action: float = 1e-4
 
 
 @dataclass

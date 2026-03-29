@@ -17,15 +17,13 @@ from tqdm import tqdm
 from src.envs.base import BaseGraphEnv
 from src.envs.sequential import SequentialGraphEnv
 from src.envs.discrete import DiscreteGraphEnv
+from src.envs.refinement import RefinementGraphEnv
 from src.models.base import BasePolicy
-from src.plot import build_nx_graph, count_hard_crossings
 from src.tasks.base import BaseArgs
 from typing import List, Dict
-from src.envs.discrete import DiscreteEnvConfig, DiscreteGraphEnv
-from src.envs.sequential import SequentialEnvConfig, SequentialGraphEnv
-from src.envs.refinement import RefinementGraphEnv, RefinementEnvConfig
 from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
 from src.tasks.discrete_ppo import DiscretePPOArgs
+from src.tasks.continuous_ppo import ContinuousPPOArgs
 from src.data.data import GraphData
 import pandas as pd
 import networkx as nx
@@ -34,172 +32,100 @@ import networkx as nx
 # ── per-graph runners ──────────────────────────────────────────────────────────
 
 
-def _run_sequential(
+def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
+    from src.envs.continuous import ContinuousGraphEnv
+    match args:
+        case DiscretePPOArgs():
+            return DiscreteGraphEnv(graph_data=graph_data,
+                                    device=device,
+                                    config=args.env)
+        case ContinuousPPOArgs():
+            return ContinuousGraphEnv(graph_data=graph_data,
+                                      device=device,
+                                      config=args.env)
+        case SequentialPPOArgs():
+            return SequentialGraphEnv(graph_data=graph_data,
+                                      device=device,
+                                      config=args.env)
+        case SequentialRefinementArgs():
+            return RefinementGraphEnv(graph_data=graph_data,
+                                      device=device,
+                                      config=args.env)
+        case _:
+            raise NotImplementedError(f"No env for args type {type(args)}")
+
+
+def _get_action(policy: BasePolicy, obs: np.ndarray, env: BaseGraphEnv, device,
+                args: BaseArgs):
+    """Call policy with the correct signature depending on env type."""
+    if isinstance(args, (SequentialPPOArgs, SequentialRefinementArgs)):
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+        action, _, _ = policy.get_action(obs_t, deterministic=True)
+    else:
+        node_features = torch.tensor(obs, dtype=torch.float32, device=device)
+        gd = env.get_graph_data()
+        action, _, _ = policy.get_action(
+            node_features,
+            gd["edge_index"].to(device),
+            gd["edge_attr"].to(device),
+            deterministic=True,
+        )
+    return action
+
+
+def run_episode(
     policy: BasePolicy,
     graph_data: GraphData,
     device,
-    args: SequentialPPOArgs | SequentialRefinementArgs,
+    args: BaseArgs,
     collect_frames: bool,
-):
-    import networkx as nx
-    match args:
-        case SequentialPPOArgs():
-            env = SequentialGraphEnv(
-                graph_data=graph_data,
-                device=device,
-                config=args.env,
-            )
-        case SequentialRefinementArgs():
-            env = RefinementGraphEnv(
-                graph_data=graph_data,
-                device=device,
-                config=args.env,
-            )
+) -> Dict:
+    env = _make_env(graph_data, device, args)
     before_coords = graph_data.neato_coords.numpy()
     initial_xing = graph_data.neato_xing
 
     obs, _ = env.reset()
-    frames: List[np.ndarray] = [env.get_coords().copy()] if collect_frames else []
-    done = False
-    while not done:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-        with torch.no_grad():
-            action, _, _ = policy.get_action(obs_t, deterministic=True)
-        obs, _, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-        if collect_frames:
-            frames.append(env.get_coords().copy())
-    coords = env.get_coords()
-    # Recompute final crossings with XingLoss for consistency with discrete/plot
-    G = nx.Graph()
-    G.add_nodes_from(range(graph_data.num_nodes))
-    edges = graph_data.edge_index.T[:graph_data.edge_index.shape[1] //
-                                    2].tolist()
-    G.add_edges_from(edges)
-
-    best_xing = count_hard_crossings(G, coords, device)
-    return {
-        "best_xing": best_xing,
-        "coords": coords,
-        "before_coords": before_coords,
-        "initial_xing": initial_xing,
-        "improvement": initial_xing - best_xing,
-        "frames": frames,
-    }
-
-
-def _run_discrete(
-    policy: BasePolicy,
-    graph_data: GraphData,
-    device,
-    args: DiscretePPOArgs,
-    collect_frames: bool,
-):
-
-    env: BaseGraphEnv = DiscreteGraphEnv(
-        graph_data=graph_data,
-        device=device,
-        config=args.env,
-    )
-    obs, info = env.reset()
-    # before_coords = env.get_coords()
-    before_coords = graph_data.neato_coords.numpy()
-    graph = build_nx_graph(graph_data)
-    # Use precomputed neato_xing to align with all_baselines.csv
-    initial_xing = graph_data.neato_xing
     best_xing = initial_xing
     best_coords = before_coords.copy()
-    frames: List[np.ndarray] = [env.get_coords().copy()] if collect_frames else []
+    frames: List[np.ndarray] = [env.get_coords().copy()
+                                ] if collect_frames else []
+    crossings: List[float] = [initial_xing]
+    rewards = [0]
     done = False
-    # done = True
+    info: Dict = {}
+
     while not done:
-        node_features = torch.tensor(obs, dtype=torch.float32, device=device)
-        gd = env.get_graph_data()
         with torch.no_grad():
-            action, _, _ = policy.get_action(
-                node_features,
-                gd["edge_index"].to(device),
-                gd["edge_attr"].to(device),
-                deterministic=True,
-            )
-        obs, _, terminated, truncated, info = env.step(action)
+            action = _get_action(policy, obs, env, device, args)
+        obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         if collect_frames:
             frames.append(env.get_coords().copy())
+        crossings.append(info["crossings"])
+        rewards.append(reward)
 
-    # Compare final state against initial using hard crossings.
-    # Soft-crossing tracking was previously used here, but with neato
-    # initialization the initial soft crossing is already ≈ 0, so the
-    # condition was never triggered and best_coords always equalled
-    # before_coords, producing identical before/after plots.
-    final_coords = env.get_coords()
-    final_xing = count_hard_crossings(graph, final_coords, device)
+    final_xing = info.get("crossings", initial_xing)
     if final_xing <= best_xing:
         best_xing = final_xing
-        best_coords = final_coords
+        best_coords = env.get_coords()
+
+    # GATGraphEnv subclasses expose .graph; SequentialGraphEnv exposes ._nx_graph
+    graph = getattr(env, "graph", None) or getattr(env, "_nx_graph")
 
     return {
+        "graph": graph,
         "coords": best_coords,
         "before_coords": before_coords,
         "initial_xing": initial_xing,
         "best_xing": best_xing,
         "improvement": initial_xing - best_xing,
+        "crossings": crossings,
         "frames": frames,
+        "rewards": rewards,
     }
 
 
 # ── GIF rendering ─────────────────────────────────────────────────────────────
-
-
-def render_gif(
-    frames: List[np.ndarray],
-    graph: nx.Graph,
-    output_path: str,
-    fps: int = 10,
-    figsize: tuple = (5, 5),
-) -> None:
-    """
-    Render a list of coordinate snapshots as an animated GIF.
-
-    Args:
-        frames:      List of [N, 2] float32 coord arrays (one per step).
-        graph:       NetworkX graph (for drawing edges).
-        output_path: Where to write the .gif file.
-        fps:         Frames per second.
-        figsize:     Matplotlib figure size.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.animation as animation
-
-    edges = list(graph.edges())
-    fig, ax = plt.subplots(figsize=figsize)
-
-    def _draw(coords: np.ndarray):
-        ax.clear()
-        ax.set_xlim(-1.1, 1.1)
-        ax.set_ylim(-1.1, 1.1)
-        ax.set_aspect("equal")
-        ax.axis("off")
-        for u, v in edges:
-            ax.plot(
-                [coords[u, 0], coords[v, 0]],
-                [coords[u, 1], coords[v, 1]],
-                color="steelblue", linewidth=0.8, alpha=0.7,
-            )
-        ax.scatter(coords[:, 0], coords[:, 1], s=20, color="tomato", zorder=3)
-
-    def _update(frame_idx):
-        _draw(frames[frame_idx])
-        ax.set_title(f"step {frame_idx}/{len(frames)-1}", fontsize=8)
-
-    ani = animation.FuncAnimation(
-        fig, _update, frames=len(frames), interval=1000 // fps, repeat=False
-    )
-    ani.save(output_path, writer="pillow", fps=fps)
-    plt.close(fig)
-
 
 # ── main evaluate ──────────────────────────────────────────────────────────────
 
@@ -249,7 +175,9 @@ def _build_comparison(results: list, baseline_csv: str, output_dir: Path):
         })
 
     if not rows:
-        print("Warning: no rows matched between results and baseline CSV.")
+        print(
+            "Warning: no rows matched between results and baselicase ContinuousPPOArgs():ne CSV."
+        )
         return [], float("nan"), float("nan"), float("nan")
 
     csv_path = output_dir / "comparison.csv"
@@ -288,9 +216,7 @@ def evaluate(
     data_root: str = None,
     split: str = "test",
     baseline_csv: str = None,
-    gif_fps: int = 24,
 ):
-    from src.plot import build_nx_graph
     print(f"Device: {device}")
 
     # Override dataset settings for evaluation
@@ -307,24 +233,13 @@ def evaluate(
 
     # policy = _load_policy(ckpt, args, device)
 
-    match args:
-        case DiscretePPOArgs():
-            runner = _run_discrete
-        case SequentialPPOArgs() | SequentialRefinementArgs():
-            runner = _run_sequential
-        case _:
-            raise NotImplementedError(
-                f"Evaluation for task '{args.name}' not implemented")
-
     results: List[Dict[str, float]] = []
 
     print(f"initial_layout: {args.env.initial_layout}")
     for i in tqdm(range(len(dataset)), desc="Evaluating"):
         graph_data = dataset[i]
 
-        graph = build_nx_graph(graph_data)
-
-        outputs = runner(
+        outputs = run_episode(
             policy=policy,
             graph_data=graph_data,
             device=device,
@@ -334,7 +249,6 @@ def evaluate(
 
         results.append({
             "graph_name": graph_data.graph_name,
-            "graph": graph,
             "num_nodes": graph_data.num_nodes,
             "num_edges": graph_data.edge_index.shape[1] // 2,
             **outputs,
@@ -344,22 +258,24 @@ def evaluate(
     out.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame(results)
-    keys = [x for x in df.columns if "coords" not in x and x != "frames"]
-    keys.remove("graph")  # Remove non-serializable graph object
+    keys = [
+        x for x in df.columns
+        if "coords" not in x and x not in ("frames", "graph")
+    ]
     df[keys].to_csv(out / "results.csv", index=False)
 
-    # ── GIF rendering ──────────────────────────────────────────────────────────
-    if collect_frames:
-        gif_dir = out / "gifs"
-        gif_dir.mkdir(exist_ok=True)
-        for r in tqdm(results, desc="Rendering GIFs"):
-            frames_data: List[np.ndarray] = r.get("frames")  # type: ignore[assignment]
-            if not frames_data:
-                continue
-            graph_name: str = r.get("graph_name")  # type: ignore[assignment]
-            gif_path = gif_dir / f"{Path(graph_name).stem}.gif"
-            render_gif(frames_data, r["graph"], str(gif_path), fps=gif_fps)  # type: ignore[arg-type]
-        print(f"GIFs saved to {gif_dir}/")
+    # ── save CSV ───────────────────────────────────────────────────────────────
+    # out.mkdir(parents=True, exist_ok=True)
+    # csv_path = out / "results.csv"
+    # with open(csv_path, "w", newline="") as f:
+    #     writer = csv.DictWriter(
+    #         f,
+    #         fieldnames=["graph_name", "num_nodes", "num_edges", "crossings"])
+    #     writer.writeheader()
+    #     writer.writerows(results)
+    # print(f"\nResults saved to {csv_path}")
+
+    # ── summary ─────────────────────────
     # ── save CSV ───────────────────────────────────────────────────────────────
     # out.mkdir(parents=True, exist_ok=True)
     # csv_path = out / "results.csv"

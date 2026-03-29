@@ -2,6 +2,7 @@ from src.tasks.base import BaseArgs
 
 from src.tasks.discrete_ppo import DiscretePPOArgs
 from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
+from src.tasks.continuous_ppo import ContinuousPPOArgs
 
 
 def create_env(
@@ -13,6 +14,13 @@ def create_env(
         case DiscretePPOArgs():
             from src.envs.discrete import DiscreteGraphEnv
             return DiscreteGraphEnv(
+                graph_data=graph_data,
+                device=device,
+                config=args.env,
+            )
+        case ContinuousPPOArgs():
+            from src.envs.continuous import ContinuousGraphEnv
+            return ContinuousGraphEnv(
                 graph_data=graph_data,
                 device=device,
                 config=args.env,

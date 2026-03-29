@@ -133,7 +133,7 @@ class ContinuousRolloutBuffer(BaseRolloutBuffer):
         env_obs = self._obs_list
 
         env_steps = [[] for _ in range(n_envs)]
-        crossing_rates = []
+        episode_crossings, episode_steps, episode_static = [], [], []
         n_ticks = n_steps // n_envs
 
         executor = self._get_executor(n_envs)
@@ -170,10 +170,10 @@ class ContinuousRolloutBuffer(BaseRolloutBuffer):
                         done=done,
                     ))
                 if done:
-                    total_xing = info["total_crossings"]
-                    rate = total_xing / envs[i].num_edges \
-                        if envs[i].num_edges > 0 else 0.0
-                    crossing_rates.append(rate)
+                    total_xing = info.get("total_crossings", info.get("crossings", 0))
+                    episode_crossings.append(total_xing)
+                    episode_steps.append(info.get("step", 0))
+                    episode_static.append(float(info.get("static_truncation", False)))
                     self._ensure_envs(n_envs, _make_env, [i])
                 else:
                     env_obs[i] = next_obs
@@ -210,10 +210,17 @@ class ContinuousRolloutBuffer(BaseRolloutBuffer):
                     done=s["done"],
                 )
 
-        avg_rate = np.mean(crossing_rates) if crossing_rates else float("nan")
+        _n = len(episode_crossings)
+        avg_xing = np.mean(episode_crossings) if _n else float("nan")
+        # crossing_rate: normalize by num_edges (all envs share the same graph in single-graph mode;
+        # in dataset mode, use the last env as a representative denominator)
+        _num_edges = envs[0].num_edges if envs and envs[0] is not None else 1
         collect_log = {
-            "crossing_rate": avg_rate,
-            "n_episodes": len(crossing_rates),
-            "sampled_graphs": sampled_graphs,
+            "final_crossings":        avg_xing,
+            "crossing_rate":          avg_xing / _num_edges if _num_edges > 0 else float("nan"),
+            "avg_steps":              np.mean(episode_steps)  if _n else float("nan"),
+            "static_truncation_rate": np.mean(episode_static) if _n else float("nan"),
+            "n_episodes":             _n,
+            "sampled_graphs":         sampled_graphs,
         }
         return torch.cat(all_advantages), torch.cat(all_returns), collect_log

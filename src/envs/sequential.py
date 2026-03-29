@@ -22,22 +22,7 @@ from src.tasks.base import BaseEnvConfig
 from src.envs.base import BaseGraphEnv
 from src.data.rome import GraphData
 from src.envs.utils import get_initial_layout
-# Acceleration priority: Cython compiled > Numba JIT > pure numpy (defined below)
-try:
-    from src.envs._crossing import segments_intersect_batch as _fast_intersect
-    _BACKEND = "cython"
-    print(f"Using Cython-accelerated crossing checker (_crossing.pyx)")
-except ImportError:
-    try:
-        from src.envs._crossing_numba import segments_intersect_batch as _fast_intersect
-        _BACKEND = "numba"
-        print(f"Using Numba-accelerated crossing checker (_crossing_numba.py)")
-    except ImportError:
-        _fast_intersect = None
-        print(
-            "Using pure NumPy crossing checker (slow; install Cython or Numba for speed)"
-        )
-        _BACKEND = "numpy"
+from src.envs.graph_layout_state import GraphLayoutState
 
 
 @dataclass
@@ -61,84 +46,6 @@ class SequentialEnvConfig(BaseEnvConfig):
     #   "spring" — start from networkx spring layout
     # initial_layout: str = "none"
     delta_scale: float = 0.1  # max offset per step in [-1,1]² space (only used when initial_layout != "none")
-
-
-def _segments_intersect_batch(
-    p1: np.ndarray,
-    p2: np.ndarray,
-    p3s: np.ndarray,
-    p4s: np.ndarray,
-    eps: float = 1e-6,
-) -> np.ndarray:
-    """
-    Check if segment (p1, p2) intersects each segment (p3s[i], p4s[i]).
-
-    Two-phase approach borrowed from polygon intersection detection:
-      Phase 1 — AABB pre-filter (vectorised, cheap): discard pairs whose
-                 bounding boxes do not overlap — necessary condition for intersection.
-      Phase 2 — Exact cross-product test (only on AABB survivors).
-
-    Args:
-        p1, p2: shape (2,) — endpoints of the new edge
-        p3s, p4s: shape (M, 2) — endpoints of M placed edges
-
-    Returns:
-        bool array of shape (M,)
-    """
-    result = np.zeros(len(p3s), dtype=bool)
-
-    # ── Phase 1: AABB pre-filter ────────────────────────────────────────────
-    p1_min = np.minimum(p1, p2)  # (2,)
-    p1_max = np.maximum(p1, p2)  # (2,)
-    p3_min = np.minimum(p3s, p4s)  # (M, 2)
-    p3_max = np.maximum(p3s, p4s)  # (M, 2)
-
-    aabb = ((p1_max[0] >= p3_min[:, 0]) & (p1_min[0] <= p3_max[:, 0]) &
-            (p1_max[1] >= p3_min[:, 1]) & (p1_min[1] <= p3_max[:, 1]))
-    if not aabb.any():
-        return result
-
-    # ── Phase 2: exact test on AABB survivors only ──────────────────────────
-    p3c = p3s[aabb]
-    p4c = p4s[aabb]
-
-    r = p2 - p1
-    s = p4c - p3c
-    qmp = p3c - p1
-
-    rxs = r[0] * s[:, 1] - r[1] * s[:, 0]
-    qmpxr = qmp[:, 0] * r[1] - qmp[:, 1] * r[0]
-    qmpxs = qmp[:, 0] * s[:, 1] - qmp[:, 1] * s[:, 0]
-
-    parallel = np.abs(rxs) < 1e-10
-    safe_rxs = np.where(parallel, 1.0, rxs)
-
-    t = qmpxs / safe_rxs
-    u = qmpxr / safe_rxs
-
-    proper = (~parallel) & (t > eps) & (t < 1 - eps) & (u > eps) & (u
-                                                                    < 1 - eps)
-
-    # Collinear overlap: closes the degenerate "all-nodes-on-a-line" trick
-    collinear = parallel & (np.abs(qmpxr) < 1e-10)
-    r_sq = float(r[0]**2 + r[1]**2)
-    safe_r_sq = r_sq if r_sq > 1e-10 else 1.0
-    t3 = (qmp * r).sum(axis=1) / safe_r_sq
-    t4 = t3 + (s * r).sum(axis=1) / safe_r_sq
-    t_lo = np.minimum(t3, t4)
-    t_hi = np.maximum(t3, t4)
-    collinear_overlap = collinear & (t_hi > eps) & (t_lo < 1 -
-                                                    eps) & (t_hi - t_lo > eps)
-
-    result[aabb] = proper | collinear_overlap
-    return result
-
-
-def _segments_intersect_batch_dispatch(p1, p2, p3s, p4s, eps=1e-6):
-    """Route to the fastest available backend."""
-    if _fast_intersect is not None:
-        return _fast_intersect(p1, p2, p3s, p4s, eps)
-    return _segments_intersect_batch(p1, p2, p3s, p4s, eps)
 
 
 class SequentialGraphEnv(BaseGraphEnv):
@@ -199,6 +106,9 @@ class SequentialGraphEnv(BaseGraphEnv):
         self._nx_graph.add_nodes_from(range(self.num_nodes))
         self._nx_graph.add_edges_from(self.undirected_edges)
 
+        self.current_graph = nx.Graph(
+        )  # placed subgraph, updated incrementally
+
         # Gymnasium spaces
         self.action_space = spaces.Box(
             low=-1.0,
@@ -219,7 +129,9 @@ class SequentialGraphEnv(BaseGraphEnv):
         self.delta_scale = config.delta_scale
 
         # Episode state (initialised in reset)
-        self.coords: Optional[np.ndarray] = None  # [num_nodes, 2]
+        self.coords: Optional[np.ndarray] = None  # float64 alias to self.gls.positions
+        self.gls: GraphLayoutState            # allocated per episode in reset()
+        self._preset_coords: Optional[np.ndarray] = None  # initial layout when initial_layout != "none"
         self.bfs_order: Optional[list] = None
         self.placed_set: Optional[set] = None
         self.placed_nodes_list: Optional[list] = None  # ordered list
@@ -313,44 +225,6 @@ class SequentialGraphEnv(BaseGraphEnv):
                 order.append(n)
         return order
 
-    def _count_new_crossings(self, vt: int, pos: np.ndarray) -> int:
-        """
-        Count edge crossings introduced by placing vt at pos.
-        Only checks new edges (vt, u) vs all already-placed edges.
-        """
-        placed_neighbors = [u for u in self.adj[vt] if u in self.placed_set]
-        if not placed_neighbors or not self.placed_edges:
-            return 0
-
-        # Build placed-edge arrays once (O(m) numpy, not O(k*m) Python loops)
-        edge_arr = np.array(self.placed_edges, dtype=np.int32)  # [m, 2]
-        eu, ev = edge_arr[:, 0], edge_arr[:, 1]
-        all_p3 = self.coords[eu]  # [m, 2]
-        all_p4 = self.coords[ev]  # [m, 2]
-
-        total = 0
-        for nb in placed_neighbors:
-            # Skip edges adjacent to (vt, nb): those sharing endpoint nb.
-            # vt has no placed edges yet so no need to filter for vt.
-            valid = (eu != nb) & (ev != nb)
-            if not valid.any():
-                continue
-            # Degenerate case: zero-length edge cannot be tested geometrically.
-            # Treat it as crossing every valid placed edge (worst case), so the
-            # policy cannot exploit stacking to achieve zero crossing count.
-            if np.linalg.norm(pos - self.coords[nb]) < 1e-6:
-                total += int(valid.sum())
-                continue
-            hits = _segments_intersect_batch_dispatch(
-                pos,
-                self.coords[nb],
-                all_p3[valid],
-                all_p4[valid],
-            )
-            total += int(hits.sum())
-
-        return total
-
     def _build_obs(self):
         """
         Build observation for deciding where to place bfs_order[step_idx].
@@ -433,10 +307,17 @@ class SequentialGraphEnv(BaseGraphEnv):
         super().reset(seed=seed)
 
         self.bfs_order = self._compute_node_order()
+
+        # GLS starts with no visible nodes; nodes are revealed via unmask_node()
+        self.gls = GraphLayoutState(self._nx_graph, [], np.zeros((0, 2)))
+        self.coords = self.gls.positions  # float64 alias; NaN for unplaced nodes
+
+        # Pre-load initial layout coords for delta-action mode
         if self.initial_layout != "none":
-            self.coords = self._get_initial_layout()
+            self._preset_coords = self._get_initial_layout()
         else:
-            self.coords = np.zeros((self.num_nodes, 2), dtype=np.float32)
+            self._preset_coords = None
+
         self.placed_set = set()
         self.placed_nodes_list = []
         self.placed_edges = []
@@ -444,15 +325,16 @@ class SequentialGraphEnv(BaseGraphEnv):
         self.total_crossings = 0
         self.current_stress = 0.0
 
+        self.current_graph = nx.Graph()  # placed subgraph, updated incrementally
+
         # When normalization is enabled, auto-place the first node at a random
         # position in [-1, 1]² to serve as a fixed anchor.  The agent's action
         # for step 0 would be meaningless (normalised away), so we skip it and
         # advance step_idx here.
         if self.normalize_coords:
             v0 = self.bfs_order[0]
-            anchor = self.np_random.uniform(-1.0, 1.0,
-                                            size=(2, )).astype(np.float32)
-            self.coords[v0] = anchor
+            anchor = self.np_random.uniform(-1.0, 1.0, size=(2,)).astype(np.float32)
+            self.gls.unmask_node(v0, anchor)
             self.placed_set.add(v0)
             self.placed_nodes_list.append(v0)
             self.step_idx = 1
@@ -470,6 +352,7 @@ class SequentialGraphEnv(BaseGraphEnv):
             "node_features": node_features,
             "edge_index": edge_index,
             "placed_nodes": [],
+            "current_graph": self.current_graph,
         }
         return node_features, info
 
@@ -477,42 +360,44 @@ class SequentialGraphEnv(BaseGraphEnv):
         assert self.step_idx < self.num_nodes, "Episode already finished"
 
         vt = self.bfs_order[self.step_idx]
-        if self.initial_layout != "none":
-            pos = np.clip(self.coords[vt] + action * self.delta_scale, -1.0,
-                          1.0).astype(np.float32)
+        if self._preset_coords is not None:
+            pos = np.clip(
+                self._preset_coords[vt] + action * self.delta_scale, -1.0, 1.0
+            ).astype(np.float32)
+            displacement = float(np.linalg.norm(pos - self._preset_coords[vt]))
         else:
             pos = np.clip(action, -1.0, 1.0).astype(np.float32)
+            displacement = float(np.linalg.norm(action))
 
-        # Crossing penalty
-        new_crossings = self._count_new_crossings(vt, pos)
+        # Crossing penalty via GLS: reveal vt and measure the delta in total crossings
+        prev_crossings = self.gls.compute_crossings()[0]
+        self.gls.unmask_node(vt, pos)
+        new_crossings = self.gls.compute_crossings()[0] - prev_crossings
         self.total_crossings += new_crossings
         reward = -float(new_crossings)
 
-        # Place node
-        self.coords[vt] = pos
+        # Update bookkeeping (placed_set / placed_edges still needed for obs building)
         self.placed_set.add(vt)
         self.placed_nodes_list.append(vt)
-
-        # Register new placed edges
         for nb in self.adj[vt]:
             if nb in self.placed_set and nb != vt:
                 self.placed_edges.append((min(vt, nb), max(vt, nb)))
 
         # Dynamic normalization: rescale all placed coords to [-1, 1]²
         if self.normalize_coords and len(self.placed_nodes_list) >= 2:
-            placed = np.array(self.placed_nodes_list)
-            c = self.coords[placed]
+            placed = list(self.placed_nodes_list)
+            c = self.gls.positions[placed]
             lo, hi = c.min(axis=0), c.max(axis=0)
             scale = hi - lo
             scale[scale == 0] = 1.0
-            self.coords[placed] = 2.0 * (c - lo) / scale - 1.0
+            self.gls.batch_update(placed, 2.0 * (c - lo) / scale - 1.0)
 
         # Random rotation augmentation: rotate all placed coords around their
         # centroid by a uniform random angle, then re-normalize to [-1, 1]².
         # Crossing count is invariant to rotation; this increases layout diversity.
         if self.rotate_augment and len(self.placed_nodes_list) >= 2:
-            placed = np.array(self.placed_nodes_list)
-            c = self.coords[placed]
+            placed = list(self.placed_nodes_list)
+            c = self.gls.positions[placed]
             theta = self.np_random.uniform(0.0, 2.0 * np.pi)
             cos_t, sin_t = np.cos(theta), np.sin(theta)
             centroid = c.mean(axis=0)
@@ -520,12 +405,11 @@ class SequentialGraphEnv(BaseGraphEnv):
             rotated = np.stack([
                 cos_t * cc[:, 0] - sin_t * cc[:, 1],
                 sin_t * cc[:, 0] + cos_t * cc[:, 1],
-            ],
-                               axis=1).astype(np.float32)
+            ], axis=1)
             lo, hi = rotated.min(axis=0), rotated.max(axis=0)
             scale = hi - lo
             scale[scale == 0] = 1.0
-            self.coords[placed] = 2.0 * (rotated - lo) / scale - 1.0
+            self.gls.batch_update(placed, 2.0 * (rotated - lo) / scale - 1.0)
 
         if (self.structure_weight > 0):
             # Structure reward: penalize delta stress (marginal cost of this placement)
@@ -536,7 +420,9 @@ class SequentialGraphEnv(BaseGraphEnv):
 
         self.step_idx += 1
         terminated = (self.step_idx >= self.num_nodes)
-        truncated = self.step_idx >= self.config.max_steps
+        static = (self.config.min_effective_action > 0
+                  and displacement < self.config.min_effective_action)
+        truncated = self.step_idx >= self.config.max_steps or static
 
         if terminated:
             node_features = np.zeros((0, 4), dtype=np.float32)
@@ -546,14 +432,23 @@ class SequentialGraphEnv(BaseGraphEnv):
             node_features, placed_nodes = self._build_obs()
             edge_index = self._build_edge_index(placed_nodes)
 
+        self.current_graph.add_node(vt)
+        for nb in self.adj[vt]:
+            if nb in self.placed_set and nb != vt:
+                self.current_graph.add_edge(vt, nb)
+
         info = {
             "vt": vt,
             "step": self.step_idx,
             "new_crossings": new_crossings,
             "total_crossings": self.total_crossings,
+            "crossings": self.total_crossings,
             "node_features": node_features,
             "edge_index": edge_index,
             "placed_nodes": placed_nodes,
+            "current_graph": self.current_graph,
+            "displacement": displacement,
+            "static_truncation": static,
         }
         return node_features, reward, terminated, truncated, info
 

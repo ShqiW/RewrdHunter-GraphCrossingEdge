@@ -14,7 +14,8 @@ from src.tasks.base import BaseArgs
 from src.data.rome import RomeDataset
 from src.envs.base import BaseGraphEnv
 from src.models.base import BasePolicy
-from src.plot import plot_discrete
+from src.plot import plot_discrete, render_gif
+from tqdm import tqdm
 import numpy as np
 
 
@@ -45,10 +46,16 @@ def main():
             from src.envs.refinement import RefinementGraphEnv as ENVClass
             from src.data.ContinuousRolloutBuffer import ContinuousRolloutBuffer as BufferClass
             args, _ = auto_extract_args(SequentialRefinementArgs)
+        case "continuous_ppo":
+            from src.tasks.continuous_ppo import ContinuousPPOArgs
+            from src.models.continuous_gnn import ContinuousGNNPolicy as ModelClass
+            from src.envs.continuous import ContinuousGraphEnv as ENVClass
+            from src.data.ContinuousGraphRolloutBuffer import ContinuousGraphRolloutBuffer as BufferClass
+            args, _ = auto_extract_args(ContinuousPPOArgs)
         case _:
             raise NotImplementedError(
                 f"Task '{base_args.name}' not implemented. "
-                f"Available tasks: discrete_ppo, sequential_ppo, sequential_refinement"
+                f"Available tasks: discrete_ppo, sequential_ppo, sequential_refinement, continuous_ppo"
             )
 
     device = torch.device(
@@ -139,6 +146,26 @@ def main():
                 f"median: {np.median(all_xings):.1f}, "
                 f"zero: {sum(1 for x in all_xings if x==0)}/{len(all_xings)}, "
                 f"zero-crossing={zero_pct:.1f}%")
+
+            # ── GIF rendering ──────────────────────────────────────────────────────────
+            gif_dir = out_dir / "gifs"
+            gif_dir.mkdir(exist_ok=True)
+            for r in tqdm(results[:10], desc="Rendering GIFs"):
+                frames_data = r.get("frames")  # type: ignore[assignment]
+                if not frames_data:
+                    continue
+                graph_name: str = r.get(
+                    "graph_name")  # type: ignore[assignment]
+                gif_path = gif_dir / f"{Path(graph_name).stem}.gif"
+                render_gif(
+                    frames=frames_data,
+                    graph=r["graph"],
+                    output_path=str(gif_path),
+                    fps=24,
+                    crossings=r["crossings"],
+                    rewards=r["rewards"],
+                )  # type: ignore[arg-type]
+            print(f"GIFs saved to {gif_dir}/")
 
 
 if __name__ == "__main__":
