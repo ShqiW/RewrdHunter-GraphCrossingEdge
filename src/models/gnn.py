@@ -24,10 +24,11 @@ NUM_DIRECTIONS = 8
 class GNNConfig(BasePPOConfig):
     """GAT model configuration"""
     num_gnn_layers: int = 3
-    node_input_dim: int = 3  # x, y, degree
+    node_input_dim: int = 4  # x, y, degree, is_in_crossing
     edge_input_dim: int = 1  # edge_length
     num_heads: int = 4
     dropout: float = 0.1
+    num_scales: int = 3  # 多尺度步长档数，与 DiscreteEnvConfig.move_scales 对应
 
 
 class DiscreteGNNPolicy(BasePolicy):
@@ -44,11 +45,6 @@ class DiscreteGNNPolicy(BasePolicy):
     def __init__(
         self,
         config: GNNConfig,
-        node_input_dim: int = 3,
-        edge_input_dim: int = 2,
-        num_gnn_layers: int = 3,
-        num_heads: int = 4,
-        dropout: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -61,6 +57,7 @@ class DiscreteGNNPolicy(BasePolicy):
         dropout = config.dropout
 
         self.num_heads = num_heads
+        self.num_scales = config.num_scales
 
         # Node feature projection
         self.node_proj = nn.Linear(node_input_dim, hidden_dim)
@@ -82,11 +79,12 @@ class DiscreteGNNPolicy(BasePolicy):
                     dropout=dropout,
                 ))
 
-        # Action head: each node outputs 8 direction logits
+        # Action head: each node outputs (8 * num_scales) logits
+        # 前 8 对应方向，每个方向有 num_scales 档步长
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, NUM_DIRECTIONS),
+            nn.Linear(hidden_dim, NUM_DIRECTIONS * self.num_scales),
         )
 
         # Value head: graph-level value estimate

@@ -224,6 +224,10 @@ def draw_graph(
     crossing_edges: set,
     title: str,
 ):
+    if not np.all(np.isfinite(coords)):
+        ax.axis("off")
+        ax.set_title(title + "\n[NaN/Inf coords]", fontsize=9, pad=4)
+        return
     ax.set_aspect("equal")
     margin = 0.05 * (coords.max() - coords.min() + 1e-6)
     ax.set_xlim(coords[:, 0].min() - margin, coords[:, 0].max() + margin)
@@ -346,24 +350,41 @@ def plot_discrete(subset: List[Dict], out_dir: Path):
 
     for r in subset:
         edges = list(r["graph"].edges())
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-        fig.suptitle(
-            f"{r['graph_name']} — Before vs After PPO (red = crossing edges)",
-            fontsize=10)
+        final_coords = r["frames"][-1]
+        best_coords = r["coords"]
+        final_xing = int(r["crossings"][-1])
+        best_xing = int(r["best_xing"])
+        initial_xing = int(r["initial_xing"])
+        has_best = r.get("has_best", True)
+
+        if has_best:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+
+        fig.suptitle(f"{r['graph_name']} (red = crossing edges)", fontsize=10)
         draw_graph(
             axes[0],
             r["before_coords"],
             edges,
             get_crossing_edges(r["before_coords"], edges),
-            f"before={r['initial_xing']}",
+            f"before={initial_xing}",
         )
         draw_graph(
             axes[1],
-            r["frames"][-1],
+            final_coords,
             edges,
-            get_crossing_edges(r["frames"][-1], edges),
-            f"after={r['crossings'][-1]}  Δ={r['improvement']}",
+            get_crossing_edges(final_coords, edges),
+            f"final={final_xing}  Δ={final_xing - initial_xing:+d}",
         )
+        if has_best:
+            draw_graph(
+                axes[2],
+                best_coords,
+                edges,
+                get_crossing_edges(best_coords, edges),
+                f"best={best_xing}  Δ={best_xing - initial_xing:+d}",
+            )
         _add_legend(fig)
         plt.tight_layout()
         plt.savefig(
@@ -411,8 +432,9 @@ def plot_comparison(comparison_csv: str, output_dir: str):
     ratio_sfdp = _ratio_vs_neato("sfdp_xing")
     ratio_smartgd = _ratio_vs_neato("smartgd_xing")
     ratio_ours = [
-        float(r["ratio_vs_neato"])
-        if r["ratio_vs_neato"] not in ("", "None") else None for r in rows
+        float(r["ratio_vs_our"]) if r["ratio_vs_our"] not in ("",
+                                                              "None") else None
+        for r in rows
     ]
 
     fig, ax = plt.subplots(figsize=(max(8, len(rows) // 10), 5))

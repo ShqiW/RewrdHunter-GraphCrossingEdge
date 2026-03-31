@@ -38,6 +38,9 @@ class ContinuousEnvConfig(BaseEnvConfig):
     # clipping falls below this threshold the state cannot change, so the episode
     # is truncated immediately.  Set to 0 to disable.
     min_effective_action: float = 1e-4
+    # Patience: truncate if crossings have not improved for this many steps.
+    # Set to 0 to disable.
+    patience: int = 50
 
 
 class ContinuousGraphEnv(GATGraphEnv):
@@ -105,7 +108,9 @@ class ContinuousGraphEnv(GATGraphEnv):
         terminated = new_crossings == 0
         static = (self.config.min_effective_action > 0
                   and max_displacement < self.config.min_effective_action)
-        truncated = self.steps >= self.config.max_steps or static
+        patience_exceeded = (self.config.patience > 0
+                             and self.no_improve_steps >= self.config.patience)
+        truncated = self.steps >= self.config.max_steps or static or patience_exceeded
 
         if self.config.use_monte_carlo_reward:
             # Reward is 0 for intermediate steps; terminal reward is the
@@ -119,8 +124,14 @@ class ContinuousGraphEnv(GATGraphEnv):
                 reward = 0.0
         else:
             old_potential = self.current_potential
-            reward = (self.current_crossings - new_crossings
-                      ) / self.max_crossings * self.crossing_weight
+            if self.soft_crossing:
+                new_soft_crossings = self._compute_soft_crossings(self.coords)
+                reward = ((self.current_soft_crossings - new_soft_crossings) /
+                          self.max_crossings * self.crossing_weight)
+                self.current_soft_crossings = new_soft_crossings
+            else:
+                reward = (self.current_crossings - new_crossings
+                          ) / self.max_crossings * self.crossing_weight
             if self.structure_weight > 0 or self.use_potential_shaping:
                 new_structure = self._compute_structure(self.coords)
                 reward += (self.current_structure -

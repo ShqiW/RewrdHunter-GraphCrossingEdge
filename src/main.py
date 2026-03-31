@@ -42,9 +42,9 @@ def main():
             args, _ = auto_extract_args(SequentialPPOArgs)
         case "sequential_refinement":
             from src.tasks.sequential_ppo import SequentialRefinementArgs
-            from src.models.transformer_policy import TransformerPlacementPolicy as ModelClass
+            from src.models.gat_refinement_policy import GATRefinementPolicy as ModelClass
             from src.envs.refinement import RefinementGraphEnv as ENVClass
-            from src.data.ContinuousRolloutBuffer import ContinuousRolloutBuffer as BufferClass
+            from src.data.GATRefinementRolloutBuffer import GATRefinementRolloutBuffer as BufferClass
             args, _ = auto_extract_args(SequentialRefinementArgs)
         case "continuous_ppo":
             from src.tasks.continuous_ppo import ContinuousPPOArgs
@@ -150,7 +150,7 @@ def main():
             # ── GIF rendering ──────────────────────────────────────────────────────────
             gif_dir = out_dir / "gifs"
             gif_dir.mkdir(exist_ok=True)
-            for r in tqdm(results[:10], desc="Rendering GIFs"):
+            for r in tqdm(results, desc="Rendering GIFs"):
                 frames_data = r.get("frames")  # type: ignore[assignment]
                 if not frames_data:
                     continue

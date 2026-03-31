@@ -1,12 +1,13 @@
 """
 Discrete action space graph layout environment.
 
-Action space: Discrete(num_nodes * 8)
-Action encoding: action = node_id * 8 + direction_id
+Action space: Discrete(num_nodes * 8 * num_scales)
+Action encoding: action = node_id * (8 * num_scales) + direction_id * num_scales + scale_id
 8 directions: ↑ ↗ → ↘ ↓ ↙ ← ↖
+num_scales step sizes: e.g. [0.05, 0.15, 0.35]
 
 State Space (GAT features):
-- Node features: [x, y, degree]
+- Node features: [x, y, degree, is_in_crossing]
 - Edge features: [edge_length]
 """
 from dataclasses import dataclass
@@ -36,13 +37,24 @@ class DiscreteEnvConfig(BaseEnvConfig):
     structure_method: str = "softmax"
     softmax_tau: Optional[float] = 1
     use_potential_shaping: bool = False
+    # 多尺度步长：agent 可以选择粗/中/细三档移动幅度
+    num_scales: int = 3
+    scale_min: float = 0.05
+    scale_max: float = 0.35
+    # Patience：连续 N 步交叉数没有改善则截断，防止横跳。0 表示禁用
+    patience: int = 50
 
 
 class DiscreteGraphEnv(GATGraphEnv):
     """
     Discrete action space graph layout environment.
 
-    Action decoding: action = node_id * 8 + direction_id
+    Action decoding:
+        node_id      = action // (NUM_DIRECTIONS * num_scales)
+        direction_id = (action % (NUM_DIRECTIONS * num_scales)) // num_scales
+        scale_id     = action % num_scales
+
+    Node features: [x, y, degree, is_in_crossing]
     """
 
     def __init__(
@@ -52,17 +64,34 @@ class DiscreteGraphEnv(GATGraphEnv):
         config: DiscreteEnvConfig,
     ) -> None:
         super().__init__(graph_data, device, config)
-        self.action_space = spaces.Discrete(self.num_nodes * NUM_DIRECTIONS)
+        self.num_scales = config.num_scales
+        self.move_scales = list(
+            np.linspace(config.scale_min, config.scale_max, config.num_scales)
+        )
+        self.action_space = spaces.Discrete(
+            self.num_nodes * NUM_DIRECTIONS * self.num_scales
+        )
         self.observation_space = spaces.Box(low=-np.inf,
                                             high=np.inf,
-                                            shape=(self.num_nodes, 3),
+                                            shape=(self.num_nodes, 4),
                                             dtype=np.float32)
         self.reset()
 
+    # ── Override: add is_in_crossing to node features ─────────────────────────
+
+    def _get_node_features(self, coords: np.ndarray) -> np.ndarray:
+        crossing_mask = self._get_crossing_node_mask()
+        return np.column_stack(
+            [coords, self.degree.reshape(-1, 1), crossing_mask.reshape(-1, 1)]
+        ).astype(np.float32)  # [N, 4]
+
     def step(self, action: int):
-        node_id = action // NUM_DIRECTIONS
-        direction_id = action % NUM_DIRECTIONS
-        delta = DIRECTIONS[direction_id] * self.move_scale
+        node_id = action // (NUM_DIRECTIONS * self.num_scales)
+        remainder = action % (NUM_DIRECTIONS * self.num_scales)
+        direction_id = remainder // self.num_scales
+        scale_id = remainder % self.num_scales
+        move_scale = self.move_scales[scale_id]
+        delta = DIRECTIONS[direction_id] * move_scale
 
         old_pos = self.gls.positions[node_id].copy()
         old_potential = self.current_potential
@@ -72,11 +101,21 @@ class DiscreteGraphEnv(GATGraphEnv):
 
         new_crossings = self._compute_crossings(self.coords)
         new_structure = self._compute_structure(self.coords)
-        new_potential = -(new_crossings +
-                          self.structure_weight * new_structure)
 
-        crossing_reward = (self.current_crossings -
-                           new_crossings) / self.max_crossings
+        reward_norm = max(1.0, self.initial_crossings)
+        if self.soft_crossing:
+            new_soft_crossings = self._compute_soft_crossings(self.coords)
+            crossing_reward = (self.current_soft_crossings -
+                               new_soft_crossings) / reward_norm
+            new_potential = -(new_soft_crossings +
+                              self.structure_weight * new_structure)
+            self.current_soft_crossings = new_soft_crossings
+        else:
+            crossing_reward = (self.current_crossings -
+                               new_crossings) / reward_norm
+            new_potential = -(new_crossings +
+                              self.structure_weight * new_structure)
+
         structure_reward = self.current_structure - new_structure
 
         if self.use_potential_shaping:
@@ -101,7 +140,9 @@ class DiscreteGraphEnv(GATGraphEnv):
         terminated = False
         static = (self.config.min_effective_action > 0
                   and displacement < self.config.min_effective_action)
-        truncated = self.steps >= self.config.max_steps or static
+        patience_exceeded = (self.config.patience > 0
+                             and self.no_improve_steps >= self.config.patience)
+        truncated = self.steps >= self.config.max_steps or static or patience_exceeded
         if self.current_crossings == 0:
             terminated = True
             reward += 10.0
@@ -120,6 +161,8 @@ class DiscreteGraphEnv(GATGraphEnv):
             "static_truncation": static,
             "action_node": node_id,
             "action_direction": direction_id,
+            "action_scale": scale_id,
+            "patience_exceeded": patience_exceeded,
         }
         return self._get_node_features(
             self.coords), reward, terminated, truncated, info

@@ -17,6 +17,11 @@ class BaseEnvConfig:
     # clipping falls below this threshold the state cannot change, so the episode
     # is truncated immediately.  Set to 0 to disable.
     min_effective_action: float = 1e-4
+    # Soft crossing reward: use differentiable sigmoid approximation for the
+    # crossing term in the reward (denser gradient signal).  Hard integer count
+    # is still used for termination and evaluation.
+    soft_crossing: bool = False
+    soft_crossing_sharpness: float = 10.0
 
 
 @dataclass

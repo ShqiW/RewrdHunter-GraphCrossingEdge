@@ -19,6 +19,7 @@ from src.data.rome import GraphData
 from src.envs.base import BaseGraphEnv
 from src.envs.graph_layout_state import GraphLayoutState
 from src.envs.utils import get_initial_layout
+from src.losses.xing import XingLoss
 from src.tasks.base import BaseEnvConfig
 
 
@@ -29,6 +30,9 @@ class RefinementEnvConfig(BaseEnvConfig):
     exclude_non_crossing: bool = False  # focus only on nodes involved in crossings
     order_method: str = "bfs"
     delta_scale: float = 0.1  # max offset per step in [-1, 1]² space
+    # Patience: truncate if crossings have not improved for this many steps.
+    # Set to 0 to disable.
+    patience: int = 100
 
 
 class RefinementGraphEnv(BaseGraphEnv):
@@ -78,6 +82,15 @@ class RefinementGraphEnv(BaseGraphEnv):
         self._nx_graph.add_nodes_from(range(self.num_nodes))
         self._nx_graph.add_edges_from(self.undirected_edges)
 
+        # ── Soft crossing (optional) ───────────────────────────────────────────
+        self.soft_crossing: bool = getattr(config, "soft_crossing", False)
+        if self.soft_crossing:
+            sharpness = getattr(config, "soft_crossing_sharpness", 10.0)
+            self.xing_loss = XingLoss(self._nx_graph, device=device, soft=True,
+                                      sharpness=sharpness)
+        else:
+            self.xing_loss = None
+
         # ── Stress precomputation (topology-fixed, reused every episode) ───────
         k = self.num_nodes
         triu = np.triu(np.ones((k, k), dtype=bool), k=1)
@@ -105,7 +118,7 @@ class RefinementGraphEnv(BaseGraphEnv):
                                        dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf,
                                             high=np.inf,
-                                            shape=(self.num_nodes, 4),
+                                            shape=(self.num_nodes, 5),
                                             dtype=np.float32)
 
         # ── Episode state (initialised in reset) ───────────────────────────────
@@ -164,14 +177,22 @@ class RefinementGraphEnv(BaseGraphEnv):
         return float((W * ((d_new - d_g)**2 - (d_old - d_g)**2)).sum() /
                      self._stress_norm)
 
+    def _compute_soft_crossings(self, coords: np.ndarray) -> float:
+        return self.xing_loss(
+            torch.tensor(coords, dtype=torch.float32, device=self.device)
+        ).item()
+
     def _build_obs(self) -> np.ndarray:
         vt = self.node_order[self.step_idx % len(self.node_order)]
         neighbors = set(self.adj[vt])
-        features = np.zeros((self.num_nodes, 4), dtype=np.float32)
+        crossing_nodes = set(self._get_nodes_in_crossings())
+        features = np.zeros((self.num_nodes, 5), dtype=np.float32)
         features[:, 0:2] = self.coords
         features[vt, 2] = 1.0
         for nb in neighbors:
             features[nb, 3] = 1.0
+        for cn in crossing_nodes:
+            features[cn, 4] = 1.0
         return features
 
     def _build_edge_index(self) -> np.ndarray:
@@ -205,6 +226,12 @@ class RefinementGraphEnv(BaseGraphEnv):
         self.step_idx = 0
         self.current_stress = self._compute_structure_stress()
         self.total_crossings = int(self.gls.compute_crossings()[0])
+        self.best_crossings = self.total_crossings
+        self.no_improve_steps = 0
+        self.current_soft_crossings = (
+            self._compute_soft_crossings(self.coords)
+            if self.soft_crossing else float(self.total_crossings)
+        )
 
         return self._build_obs(), {
             "vt": self.node_order[0] if self.node_order else None,
@@ -235,7 +262,14 @@ class RefinementGraphEnv(BaseGraphEnv):
         new_total = int(self.gls.compute_crossings()[0])
         delta_crossings = new_total - prev_total
 
-        reward = -float(delta_crossings) - self.structure_weight * ds
+        if self.soft_crossing:
+            new_soft = self._compute_soft_crossings(self.coords)
+            crossing_penalty = new_soft - self.current_soft_crossings
+            self.current_soft_crossings = new_soft
+        else:
+            crossing_penalty = float(delta_crossings)
+
+        reward = -crossing_penalty - self.structure_weight * ds
 
         self.current_stress += ds
         self.total_crossings = new_total
@@ -251,12 +285,20 @@ class RefinementGraphEnv(BaseGraphEnv):
                 2.0 * (self.coords - lo) / scale - 1.0,
             )
 
+        if new_total < self.best_crossings:
+            self.best_crossings = new_total
+            self.no_improve_steps = 0
+        else:
+            self.no_improve_steps += 1
+
         self.step_idx += 1
         terminated = self.total_crossings <= 0
         static = (self.config.min_effective_action > 0
                   and displacement < self.config.min_effective_action)
+        patience_exceeded = (self.config.patience > 0
+                             and self.no_improve_steps >= self.config.patience)
         truncated = (self.step_idx >= self.config.max_steps
-                     or static) and not terminated
+                     or static or patience_exceeded) and not terminated
 
         return self._build_obs(), reward, terminated, truncated, {
             "vt": vt,
@@ -271,9 +313,17 @@ class RefinementGraphEnv(BaseGraphEnv):
     # ── Policy interface ───────────────────────────────────────────────────────
 
     def get_graph_data(self):
+        edge_index_np = self._build_edge_index()  # [2, 2E] numpy
+        edge_index = torch.tensor(edge_index_np, dtype=torch.long)
+        src, dst = edge_index_np[0], edge_index_np[1]
+        lengths = np.sqrt(
+            ((self.coords[src] - self.coords[dst]) ** 2).sum(axis=-1, keepdims=True)
+        ).astype(np.float32)
+        edge_attr = torch.tensor(lengths, dtype=torch.float32)
         return {
             "node_features": self._build_obs(),
-            "edge_index": self._build_edge_index(),
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
         }
 
     def get_coords(self) -> np.ndarray:

@@ -23,6 +23,7 @@ from src.envs.base import BaseGraphEnv
 from src.data.rome import GraphData
 from src.envs.utils import get_initial_layout
 from src.envs.graph_layout_state import GraphLayoutState
+from src.losses.xing import XingLoss
 
 
 @dataclass
@@ -108,6 +109,15 @@ class SequentialGraphEnv(BaseGraphEnv):
 
         self.current_graph = nx.Graph(
         )  # placed subgraph, updated incrementally
+
+        # ── Soft crossing (optional) ───────────────────────────────────────────
+        self.soft_crossing: bool = getattr(config, "soft_crossing", False)
+        if self.soft_crossing:
+            sharpness = getattr(config, "soft_crossing_sharpness", 10.0)
+            self.xing_loss = XingLoss(self._nx_graph, device=device, soft=True,
+                                      sharpness=sharpness)
+        else:
+            self.xing_loss = None
 
         # Gymnasium spaces
         self.action_space = spaces.Box(
@@ -224,6 +234,16 @@ class SequentialGraphEnv(BaseGraphEnv):
             if n not in visited:
                 order.append(n)
         return order
+
+    def _compute_soft_crossings(self, coords: np.ndarray) -> float:
+        # Unplaced nodes have NaN positions; replace with 0.0 so XingLoss
+        # doesn't produce NaN.  Only edges with both endpoints placed are
+        # geometrically meaningful, but non-placed edges will cancel in the
+        # before/after delta since their dummy coordinates don't change.
+        safe = np.where(np.isnan(coords), 0.0, coords)
+        return self.xing_loss(
+            torch.tensor(safe, dtype=torch.float32, device=self.device)
+        ).item()
 
     def _build_obs(self):
         """
@@ -370,11 +390,17 @@ class SequentialGraphEnv(BaseGraphEnv):
             displacement = float(np.linalg.norm(action))
 
         # Crossing penalty via GLS: reveal vt and measure the delta in total crossings
+        if self.soft_crossing:
+            soft_before = self._compute_soft_crossings(self.gls.positions)
         prev_crossings = self.gls.compute_crossings()[0]
         self.gls.unmask_node(vt, pos)
         new_crossings = self.gls.compute_crossings()[0] - prev_crossings
         self.total_crossings += new_crossings
-        reward = -float(new_crossings)
+        if self.soft_crossing:
+            soft_after = self._compute_soft_crossings(self.gls.positions)
+            reward = -(soft_after - soft_before)
+        else:
+            reward = -float(new_crossings)
 
         # Update bookkeeping (placed_set / placed_edges still needed for obs building)
         self.placed_set.add(vt)

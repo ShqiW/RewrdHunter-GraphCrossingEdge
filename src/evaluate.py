@@ -34,11 +34,14 @@ import networkx as nx
 
 def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
     from src.envs.continuous import ContinuousGraphEnv
+    import copy
     match args:
         case DiscretePPOArgs():
+            eval_config = copy.copy(args.env)
+            eval_config.min_effective_action = 0.0  # evaluation 时不做 static truncation
             return DiscreteGraphEnv(graph_data=graph_data,
                                     device=device,
-                                    config=args.env)
+                                    config=eval_config)
         case ContinuousPPOArgs():
             return ContinuousGraphEnv(graph_data=graph_data,
                                       device=device,
@@ -58,10 +61,12 @@ def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
 def _get_action(policy: BasePolicy, obs: np.ndarray, env: BaseGraphEnv, device,
                 args: BaseArgs):
     """Call policy with the correct signature depending on env type."""
-    if isinstance(args, (SequentialPPOArgs, SequentialRefinementArgs)):
+    if isinstance(args, SequentialPPOArgs):
+        # Transformer policy: obs only
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
         action, _, _ = policy.get_action(obs_t, deterministic=True)
     else:
+        # GAT policy: obs + edge_index + edge_attr
         node_features = torch.tensor(obs, dtype=torch.float32, device=device)
         gd = env.get_graph_data()
         action, _, _ = policy.get_action(
@@ -101,16 +106,24 @@ def run_episode(
         done = terminated or truncated
         if collect_frames:
             frames.append(env.get_coords().copy())
-        crossings.append(info["crossings"])
+        current_xing = info["crossings"]
+        crossings.append(current_xing)
         rewards.append(reward)
-
-    final_xing = info.get("crossings", initial_xing)
-    if final_xing <= best_xing:
-        best_xing = final_xing
-        best_coords = env.get_coords()
+        if current_xing < best_xing:
+            best_xing = current_xing
+            best_coords = env.get_coords().copy()
 
     # GATGraphEnv subclasses expose .graph; SequentialGraphEnv exposes ._nx_graph
     graph = getattr(env, "graph", None) or getattr(env, "_nx_graph")
+
+    # For sequential placement (one-shot), intermediate best is meaningless —
+    # the final complete layout is the only valid result.
+    is_sequential = isinstance(args, SequentialPPOArgs)
+    if is_sequential:
+        best_coords = env.get_coords().copy()
+        best_xing = int(crossings[-1])
+
+    final_xing = int(crossings[-1])
 
     return {
         "graph": graph,
@@ -118,10 +131,13 @@ def run_episode(
         "before_coords": before_coords,
         "initial_xing": initial_xing,
         "best_xing": best_xing,
+        "final_xing": final_xing,
         "improvement": initial_xing - best_xing,
+        "final_improvement": initial_xing - final_xing,
         "crossings": crossings,
         "frames": frames,
         "rewards": rewards,
+        "has_best": not is_sequential,
     }
 
 
@@ -169,7 +185,7 @@ def _build_comparison(results: list, baseline_csv: str, output_dir: Path):
             "sfdp_xing": sfdp,
             "smartgd_xing": smartgd,
             "our_xing": our,
-            "ratio_vs_neato": _compute_ratio(our, neato),
+            "ratio_vs_our": _compute_ratio(our, neato),
             "ratio_vs_sfdp": _compute_ratio(sfdp, neato),
             "ratio_vs_smartgd": _compute_ratio(smartgd, neato),
         })
@@ -192,19 +208,22 @@ def _build_comparison(results: list, baseline_csv: str, output_dir: Path):
         vals = [r[key] for r in rows if r[key] is not None]
         return np.mean(vals) if vals else float("nan")
 
-    mr_neato = _mean_ratio("ratio_vs_neato")
+    mr_our = _mean_ratio("ratio_vs_our")
     mr_sfdp = _mean_ratio("ratio_vs_sfdp")
     mr_smartgd = _mean_ratio("ratio_vs_smartgd")
 
-    print("\n--- Comparison vs Baselines (neato as reference) ---")
-    print(f"  vs neato:   mean ratio = {mr_neato:+.4f}  "
-          f"({'better' if mr_neato < 0 else 'worse'})")
-    print(f"  vs sfdp:    mean ratio = {mr_sfdp:+.4f}  "
-          f"({'better' if mr_sfdp < 0 else 'worse'})")
-    print(f"  vs smartgd: mean ratio = {mr_smartgd:+.4f}  "
-          f"({'better' if mr_smartgd < 0 else 'worse'})")
+    comparison_lines = [
+        "\n--- Comparison vs Baselines (neato as reference) ---",
+        f"ours:   mean ratio = {mr_our:+.4f}  "
+        f"({'better' if mr_our < 0 else 'worse'})",
+        f"sfdp:    mean ratio = {mr_sfdp:+.4f}  "
+        f"({'better' if mr_sfdp < 0 else 'worse'})",
+        f" smartgd: mean ratio = {mr_smartgd:+.4f}  "
+        f"({'better' if mr_smartgd < 0 else 'worse'})",
+    ]
+    print("\n".join(comparison_lines))
 
-    return rows, mr_neato, mr_sfdp, mr_smartgd
+    return rows, mr_our, mr_sfdp, mr_smartgd, comparison_lines
 
 
 def evaluate(
@@ -288,28 +307,80 @@ def evaluate(
     # print(f"\nResults saved to {csv_path}")
 
     # ── summary ────────────────────────────────────────────────────────────────
-    crossings = [r["best_xing"] for r in results]
-    zero = sum(1 for x in crossings if x == 0)
+    best_xings = np.array([r["best_xing"] for r in results])
+    final_xings = np.array([r["final_xing"] for r in results])
+    initial_xings = np.array([r["initial_xing"] for r in results])
+    zero_best = int((best_xings == 0).sum())
+    zero_final = int((final_xings == 0).sum())
+
+    # Compute ratio vs neato if baseline_csv provided
+    neato_ratio_lines = []
+    if baseline_csv:
+        import csv as _csv
+        baselines = {}
+        with open(baseline_csv, newline="") as f:
+            for row in _csv.DictReader(f):
+                baselines[row["graph_id"]] = int(row["neato_xing"])
+        neato_vals, best_vals, final_vals = [], [], []
+        for r in results:
+            graph_id = r["graph_name"].replace("grafo", "").split(".")[0]
+            if graph_id in baselines:
+                n = baselines[graph_id]
+                neato_vals.append(n)
+                best_vals.append(r["best_xing"])
+                final_vals.append(r["final_xing"])
+        if neato_vals:
+            neato_arr = np.array(neato_vals)
+            best_arr = np.array(best_vals)
+            final_arr = np.array(final_vals)
+            denom = np.maximum(np.maximum(best_arr, neato_arr), 1)
+            ratio_best = np.mean((best_arr - neato_arr) / denom)
+            denom2 = np.maximum(np.maximum(final_arr, neato_arr), 1)
+            ratio_final = np.mean((final_arr - neato_arr) / denom2)
+            neato_ratio_lines = [
+                f"",
+                f"Ratio vs neato  (negative = better than neato):",
+                f" best_xing:   {ratio_best:+.4f}  ({'better' if ratio_best < 0 else 'worse'})",
+                f"  final_xing:  {ratio_final:+.4f}  ({'better' if ratio_final < 0 else 'worse'})",
+            ]
+
     summary_lines = [
         f"Split: {split}  |  Graphs evaluated: {len(results)}",
         f"",
-        f"Crossings:",
-        f"  Mean:    {np.mean(crossings):.2f}",
-        f"  Median:  {np.median(crossings):.1f}",
-        f"  Min:     {np.min(crossings)}",
-        f"  Max:     {np.max(crossings)}",
-        f"  Zero:    {zero} / {len(results)} ({100*zero/len(results):.1f}%)",
+        f"Best crossings (lowest seen during episode):",
+        f"  Mean:    {np.mean(best_xings):.2f}",
+        f"  Median:  {np.median(best_xings):.1f}",
+        f"  Min:     {int(np.min(best_xings))}",
+        f"  Max:     {int(np.max(best_xings))}",
+        f"  Zero:    {zero_best} / {len(results)} ({100*zero_best/len(results):.1f}%)",
+        f"",
+        f"Final crossings (end-of-episode state):",
+        f"  Mean:    {np.mean(final_xings):.2f}",
+        f"  Median:  {np.median(final_xings):.1f}",
+        f"  Min:     {int(np.min(final_xings))}",
+        f"  Max:     {int(np.max(final_xings))}",
+        f"  Zero:    {zero_final} / {len(results)} ({100*zero_final/len(results):.1f}%)",
+        *neato_ratio_lines,
     ]
     summary_text = "\n".join(summary_lines)
     print("\n" + summary_text)
 
+    # ── config dump ────────────────────────────────────────────────────────────
+    import dataclasses, json as _json
+    config_dict = dataclasses.asdict(args)
+    config_lines = "\n\n--- Config ---\n" + _json.dumps(
+        config_dict, indent=2, default=str)
+
     summary_path = out / "summary.txt"
-    summary_path.write_text(summary_text)
+    summary_path.write_text(summary_text + config_lines)
     print(f"Summary saved to {summary_path}")
 
     # ── baseline comparison ────────────────────────────────────────────────────
     comparison_rows = None
     if baseline_csv:
         comparison_rows = _build_comparison(results, baseline_csv, out)
+        _, _, _, _, comparison_lines = comparison_rows
+        with open(summary_path, "a") as f:
+            f.write("\n" + "\n".join(comparison_lines) + "\n")
 
     return results, comparison_rows

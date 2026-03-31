@@ -30,8 +30,8 @@ LOG_STD_MAX = 2.0
 class ContinuousGNNConfig(BasePPOConfig):
     """Continuous GAT policy configuration"""
     num_gnn_layers: int = 3
-    node_input_dim: int = 3   # x, y, degree
-    edge_input_dim: int = 1   # edge_length
+    node_input_dim: int = 3  # x, y, degree
+    edge_input_dim: int = 1  # edge_length
     num_heads: int = 4
     dropout: float = 0.1
     move_scale: float = 0.05  # clips sampled action to [-move_scale, move_scale]
@@ -69,8 +69,7 @@ class ContinuousGNNPolicy(BasePolicy):
                 concat=True,
                 edge_dim=hidden_dim,
                 dropout=dropout,
-            )
-            for _ in range(config.num_gnn_layers)
+            ) for _ in range(config.num_gnn_layers)
         ])
 
         # Actor head: per-node 2D mean
@@ -81,8 +80,7 @@ class ContinuousGNNPolicy(BasePolicy):
         )
 
         # Shared log_std (learnable scalar, clamped during forward)
-        self.log_std = nn.Parameter(
-            torch.full((2,), config.init_log_std))
+        self.log_std = nn.Parameter(torch.full((2, ), config.init_log_std))
 
         # Critic head
         self.value_head = nn.Sequential(
@@ -112,13 +110,16 @@ class ContinuousGNNPolicy(BasePolicy):
             graph_emb:  [num_graphs, hidden_dim]
         """
         x = self.node_proj(node_features)
-        edge_emb = self.edge_proj(edge_attr) if edge_attr is not None and edge_attr.shape[0] > 0 else None
+        edge_emb = self.edge_proj(
+            edge_attr
+        ) if edge_attr is not None and edge_attr.shape[0] > 0 else None
 
         for gat in self.gat_layers:
             x = F.elu(gat(x, edge_index, edge_attr=edge_emb))
 
         if batch is None:
-            batch = torch.zeros(node_features.shape[0], dtype=torch.long,
+            batch = torch.zeros(node_features.shape[0],
+                                dtype=torch.long,
                                 device=node_features.device)
         graph_emb = global_mean_pool(x, batch)
         return x, graph_emb
@@ -138,11 +139,12 @@ class ContinuousGNNPolicy(BasePolicy):
             std:   [2]               — shared std (broadcast over nodes)
             value: [num_graphs]      — critic estimate
         """
-        node_embs, graph_emb = self.encode(node_features, edge_index, edge_attr, batch)
-        mu = self.mu_head(node_embs)                           # [total_nodes, 2]
+        node_embs, graph_emb = self.encode(node_features, edge_index,
+                                           edge_attr, batch)
+        mu = self.mu_head(node_embs)  # [total_nodes, 2]
         log_std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
-        std = log_std.exp()                                    # [2]
-        value = self.value_head(graph_emb).squeeze(-1)        # [num_graphs]
+        std = log_std.exp()  # [2]
+        value = self.value_head(graph_emb).squeeze(-1)  # [num_graphs]
         return mu, std, value
 
     def get_action(
@@ -171,9 +173,9 @@ class ContinuousGNNPolicy(BasePolicy):
         # tanh squashing: action in (-move_scale, move_scale), no hard wall
         action = torch.tanh(raw) * self.move_scale
         # correct log_prob for tanh transform: log|da/du| = log(1 - tanh²) + log(scale)
-        log_prob = (dist.log_prob(raw)
-                    - torch.log(1 - action.pow(2) / self.move_scale ** 2 + 1e-6)
-                    ).mean()
+        log_prob = (
+            dist.log_prob(raw) -
+            torch.log(1 - action.pow(2) / self.move_scale**2 + 1e-6)).mean()
 
         return action.detach().cpu().numpy(), log_prob, value.squeeze()
 
@@ -196,7 +198,7 @@ class ContinuousGNNPolicy(BasePolicy):
             batch_input.edge_attr,
             batch=batch_input.batch,
         )
-        mu_all = self.mu_head(node_embs)           # [total_nodes, 2]
+        mu_all = self.mu_head(node_embs)  # [total_nodes, 2]
         log_std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
         std = log_std.exp()
         values = self.value_head(graph_embs).squeeze(-1)  # [B]
@@ -207,13 +209,13 @@ class ContinuousGNNPolicy(BasePolicy):
 
         for i in range(batch_size):
             s, e = ptr[i].item(), ptr[i + 1].item()
-            mu_i = mu_all[s:e]                             # [num_nodes_i, 2]
+            mu_i = mu_all[s:e]  # [num_nodes_i, 2]
             dist = Normal(mu_i, std.expand_as(mu_i))
             raw = mu_i if deterministic else dist.rsample()
             action = torch.tanh(raw) * self.move_scale
-            lp = (dist.log_prob(raw)
-                  - torch.log(1 - action.pow(2) / self.move_scale ** 2 + 1e-6)
-                  ).mean()
+            lp = (dist.log_prob(raw) -
+                  torch.log(1 - action.pow(2) / self.move_scale**2 +
+                            1e-6)).mean()
             actions.append(action.detach().cpu().numpy())
             log_probs.append(lp)
 
@@ -257,10 +259,11 @@ class ContinuousGNNPolicy(BasePolicy):
             dist = Normal(mu_i, std.expand_as(mu_i))
             a_i = actions[i].to(mu_i.device)
             # a_i = tanh(raw) * move_scale  →  raw = atanh(a_i / move_scale)
-            raw_i = torch.atanh((a_i / self.move_scale).clamp(-1 + 1e-6, 1 - 1e-6))
-            lp = (dist.log_prob(raw_i)
-                  - torch.log(1 - a_i.pow(2) / self.move_scale ** 2 + 1e-6)
-                  ).mean()
+            raw_i = torch.atanh(
+                (a_i / self.move_scale).clamp(-1 + 1e-6, 1 - 1e-6))
+            lp = (
+                dist.log_prob(raw_i) -
+                torch.log(1 - a_i.pow(2) / self.move_scale**2 + 1e-6)).mean()
             log_probs.append(lp)
             entropies.append(dist.entropy().mean())
 

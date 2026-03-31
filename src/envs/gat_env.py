@@ -17,6 +17,7 @@ from src.data.data import GraphData
 from src.envs.base import BaseGraphEnv
 from src.envs.graph_layout_state import GraphLayoutState
 from src.envs.utils import get_initial_layout
+from src.losses.xing import XingLoss
 from src.tasks.base import BaseEnvConfig
 
 
@@ -46,6 +47,7 @@ class GATGraphEnv(BaseGraphEnv):
         self.use_potential_shaping: bool = getattr(
             config, "use_potential_shaping", False
         )
+        self.soft_crossing: bool = getattr(config, "soft_crossing", False)
 
         # ── Graph topology ─────────────────────────────────────────────────────
         self.num_nodes: int = graph_data.num_nodes
@@ -65,6 +67,14 @@ class GATGraphEnv(BaseGraphEnv):
             [self.graph.degree(i) for i in range(self.num_nodes)],
             dtype=np.float32,
         )
+
+        # ── Soft crossing loss (optional, for denser reward signal) ───────────
+        if self.soft_crossing:
+            sharpness = getattr(config, "soft_crossing_sharpness", 10.0)
+            self.xing_loss = XingLoss(self.graph, device=device, soft=True,
+                                      sharpness=sharpness)
+        else:
+            self.xing_loss = None
 
         # ── Structure loss ─────────────────────────────────────────────────────
         structure_method: str = getattr(config, "structure_method", "softmax")
@@ -99,6 +109,7 @@ class GATGraphEnv(BaseGraphEnv):
         self.initial_crossings: float
         self.initial_structure: float
         self.best_crossings: float
+        self.current_soft_crossings: float
         self.steps: int = 0
         self.no_improve_steps: int = 0
 
@@ -106,6 +117,12 @@ class GATGraphEnv(BaseGraphEnv):
 
     def _compute_crossings(self, coords: np.ndarray) -> float:
         return float(self.gls.compute_crossings()[0])
+
+    def _compute_soft_crossings(self, coords: np.ndarray) -> float:
+        """Soft (differentiable) crossing count via sigmoid approximation."""
+        return self.xing_loss(
+            torch.tensor(coords, dtype=torch.float32, device=self.device)
+        ).item()
 
     def _compute_structure(self, coords: np.ndarray) -> float:
         return self.structure_loss(
@@ -119,6 +136,19 @@ class GATGraphEnv(BaseGraphEnv):
             return np.array([], dtype=np.float32)
         diff = coords[self.edge_index[0]] - coords[self.edge_index[1]]
         return np.linalg.norm(diff, axis=1).astype(np.float32)
+
+    def _get_crossing_node_mask(self) -> np.ndarray:
+        """返回 [N] float32，节点是否参与至少一个交叉边。"""
+        _, crossing_matrix = self.gls.compute_crossings()  # (E, E) bool
+        involved = np.where(
+            crossing_matrix.any(axis=1) | crossing_matrix.any(axis=0)
+        )[0]
+        mask = np.zeros(self.num_nodes, dtype=np.float32)
+        for e_idx in involved:
+            u, v = self.gls.edges[e_idx]
+            mask[u] = 1.0
+            mask[v] = 1.0
+        return mask
 
     def _get_node_features(self, coords: np.ndarray) -> np.ndarray:
         return np.column_stack(
@@ -137,7 +167,7 @@ class GATGraphEnv(BaseGraphEnv):
         )
         min_c = raw.min(axis=0)
         scale = (raw.max(axis=0) - min_c).max() or 1.0
-        return (raw - min_c) / scale  # normalised to [0, 1]
+        return 2.0 * (raw - min_c) / scale - 1.0  # normalised to [-1, 1]
 
     # ── Reset ──────────────────────────────────────────────────────────────────
 
@@ -158,6 +188,10 @@ class GATGraphEnv(BaseGraphEnv):
         self.initial_crossings = self.current_crossings
         self.initial_structure = self.current_structure
         self.best_crossings = self.current_crossings
+        self.current_soft_crossings = (
+            self._compute_soft_crossings(self.coords)
+            if self.soft_crossing else self.current_crossings
+        )
         self.steps = 0
         self.no_improve_steps = 0
 
