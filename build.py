@@ -19,6 +19,12 @@ _EXTENSIONS = [
         include_dirs=[np.get_include()],
         extra_compile_args=["-O3", "-march=native", "-ffast-math"],
     ),
+    Extension(
+        name="src.envs._crossing_all",
+        sources=["src/envs/_crossing_all.pyx"],
+        include_dirs=[np.get_include()],
+        extra_compile_args=["-O3", "-march=native", "-ffast-math"],
+    ),
 ]
 
 _COMPILER_DIRECTIVES = {

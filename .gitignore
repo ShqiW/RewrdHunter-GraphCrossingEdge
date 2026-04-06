@@ -85,3 +85,4 @@ src/envs/_crossing.c
 
 *.txt
 entry/__init__.py
+*.c
