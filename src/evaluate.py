@@ -39,6 +39,7 @@ def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
         case DiscretePPOArgs():
             eval_config = copy.copy(args.env)
             eval_config.min_effective_action = 0.0  # evaluation 时不做 static truncation
+            eval_config.patience = 0  # evaluation 时跑满 max_steps
             return DiscreteGraphEnv(graph_data=graph_data,
                                     device=device,
                                     config=eval_config)

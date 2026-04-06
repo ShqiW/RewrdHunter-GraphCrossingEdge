@@ -33,6 +33,9 @@ class RefinementEnvConfig(BaseEnvConfig):
     # Patience: truncate if crossings have not improved for this many steps.
     # Set to 0 to disable.
     patience: int = 100
+    # When patience triggers, reset layout to best_coords and continue instead
+    # of truncating. Episode only ends via max_steps or zero crossings.
+    reset_to_best: bool = False
 
 
 class RefinementGraphEnv(BaseGraphEnv):
@@ -227,6 +230,7 @@ class RefinementGraphEnv(BaseGraphEnv):
         self.current_stress = self._compute_structure_stress()
         self.total_crossings = int(self.gls.compute_crossings()[0])
         self.best_crossings = self.total_crossings
+        self.best_coords = self.coords.copy()
         self.no_improve_steps = 0
         self.current_soft_crossings = (
             self._compute_soft_crossings(self.coords)
@@ -287,6 +291,7 @@ class RefinementGraphEnv(BaseGraphEnv):
 
         if new_total < self.best_crossings:
             self.best_crossings = new_total
+            self.best_coords = self.coords.copy()
             self.no_improve_steps = 0
         else:
             self.no_improve_steps += 1
@@ -297,6 +302,18 @@ class RefinementGraphEnv(BaseGraphEnv):
                   and displacement < self.config.min_effective_action)
         patience_exceeded = (self.config.patience > 0
                              and self.no_improve_steps >= self.config.patience)
+
+        if patience_exceeded and self.config.reset_to_best and not terminated:
+            # Reset layout to best known position and continue the episode
+            self.gls.batch_update(range(self.num_nodes), self.best_coords)
+            self.total_crossings = self.best_crossings
+            self.no_improve_steps = 0
+            np.random.shuffle(self.node_order)
+            if self.soft_crossing:
+                self.current_soft_crossings = self._compute_soft_crossings(self.coords)
+            self.current_stress = self._compute_structure_stress()
+            patience_exceeded = False
+
         truncated = (self.step_idx >= self.config.max_steps
                      or static or patience_exceeded) and not terminated
 
