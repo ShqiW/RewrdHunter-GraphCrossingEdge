@@ -119,6 +119,7 @@ class RomeDataset(Dataset):
         """Process a single graph file."""
         # Load graph
         G = nx.read_graphml(graph_path)
+        original_labels_lex = sorted(G.nodes())  # lex-sorted original string IDs, index i → label for integer i
         G = nx.convert_node_labels_to_integers(G, ordering="sorted")
 
         # Skip empty or trivial graphs
@@ -129,7 +130,12 @@ class RomeDataset(Dataset):
         if not nx.is_connected(G):
             largest_cc = max(nx.connected_components(G), key=len)
             G = G.subgraph(largest_cc).copy()
+            cc_ints_sorted = sorted(largest_cc)  # sorted integers from first conversion
             G = nx.convert_node_labels_to_integers(G, ordering="sorted")
+            # new integer j → cc_ints_sorted[j] → original_labels_lex[cc_ints_sorted[j]]
+            node_ids = [original_labels_lex[k] for k in cc_ints_sorted]
+        else:
+            node_ids = original_labels_lex
 
         num_nodes = G.number_of_nodes()
 
@@ -166,6 +172,7 @@ class RomeDataset(Dataset):
             "graph_name": graph_name,
             "neato_coords": neato_coords,
             "neato_xing": neato_xing,
+            "node_ids": node_ids,
         }
 
     def _compute_neato_coords(self, G: nx.Graph) -> torch.Tensor:
@@ -242,6 +249,7 @@ class RomeDataset(Dataset):
             graph_name=data_dict["graph_name"],
             neato_coords=data_dict["neato_coords"],
             neato_xing=data_dict["neato_xing"],
+            node_ids=data_dict.get("node_ids"),
         )
 
     def sample(self) -> GraphData:

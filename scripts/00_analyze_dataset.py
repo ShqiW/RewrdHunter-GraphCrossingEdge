@@ -4,9 +4,11 @@ Analyze Rome dataset and split into train/test sets.
 """
 import os
 import glob
+import networkx as nx
+from collections import defaultdict
 
 
-def analyze_dataset(data_dir="rome/rome"):
+def analyze_dataset(data_dir="rome"):
     """Analyze the Rome dataset distribution."""
     pattern = os.path.join(data_dir, "grafo*.graphml")
     files = glob.glob(pattern)
@@ -35,6 +37,44 @@ def analyze_dataset(data_dir="rome/rome"):
     print("=" * 60)
 
     return nums, file_map
+
+
+def analyze_node_distribution(train_files, test_files, bin_size=10):
+    """统计 train/test 集中各图的节点数分布，按区间分组输出。"""
+
+    def count_bins(fpaths):
+        bins = defaultdict(int)
+        counts = []
+        for fpath in fpaths:
+            G = nx.read_graphml(fpath)
+            n = G.number_of_nodes()
+            counts.append(n)
+            lo = (n - 1) // bin_size * bin_size + 1
+            bins[lo] += 1
+        return bins, counts
+
+    print("Counting train set node distribution...")
+    train_bins, train_counts = count_bins(train_files)
+    print("Counting test set node distribution...")
+    test_bins, test_counts = count_bins(test_files)
+
+    all_los = sorted(set(train_bins) | set(test_bins))
+
+    print()
+    print("=" * 50)
+    print("Node Count Distribution")
+    print("=" * 50)
+    print(f"{'Range':<12} {'Train':>8} {'Test':>8}")
+    print("-" * 30)
+    for lo in all_los:
+        hi = lo + bin_size - 1
+        print(f"{lo:>3} - {hi:<4}   {train_bins[lo]:>8} {test_bins[lo]:>8}")
+    print("-" * 30)
+    print(f"{'Total':<12} {len(train_counts):>8} {len(test_counts):>8}")
+    print(f"{'Min nodes':<12} {min(train_counts):>8} {min(test_counts):>8}")
+    print(f"{'Max nodes':<12} {max(train_counts):>8} {max(test_counts):>8}")
+    print(f"{'Mean nodes':<12} {sum(train_counts)/len(train_counts):>8.1f} {sum(test_counts)/len(test_counts):>8.1f}")
+    print("=" * 50)
 
 
 def split_dataset(nums, file_map, train_cutoff=9999, test_start=10000, test_end=10100):
@@ -92,3 +132,6 @@ if __name__ == "__main__":
         test_start=10000,
         test_end=10100
     )
+
+    # Node count distribution
+    analyze_node_distribution(train_files, test_files)
