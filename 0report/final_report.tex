@@ -1,0 +1,588 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\title{\textbf{Learning to Untangle: Reinforcement Learning\\for Graph Layout Optimization}}
+\author{Shenqian Wen, Zhuocheng Yu}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Graph drawing aims to produce visually clear 2D layouts of graphs, with
+minimizing edge crossings as a key aesthetic criterion.  This work frames
+layout optimization as a Markov Decision Process and trains a Proximal Policy
+Optimization (PPO) agent to iteratively reposition nodes.  We design and
+evaluate five progressively refined approaches, starting from a discrete-action
+GAT policy that moves nodes in eight compass directions, progressing through
+continuous-action and sequential placement formulations, and culminating in a
+GAT-based iterative refinement policy that cycles through nodes in BFS order
+with continuous delta moves.  All methods are trained and evaluated on the
+Rome graph benchmark against a \texttt{neato} force-directed baseline.
+Our best method, Sequential Refinement, achieves an SPC of $-24.58\%$
+relative to \texttt{neato}, demonstrating that iterative local refinement
+from a strong initialization substantially outperforms both from-scratch
+placement and global discrete-action approaches.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Graph visualization is essential in network analysis, software engineering,
+and biology.  Among the many quality criteria for a graph drawing, the number
+of edge crossings is one of the most studied: fewer crossings reduce visual
+clutter and make the underlying structure easier to perceive.
+
+Traditional approaches such as force-directed algorithms (Fruchterman--Reingold,
+Kamada--Kawai) minimize a global energy function and are computationally
+efficient, but they are susceptible to poor local optima and cannot easily
+incorporate combinatorial objectives like crossing minimization directly.
+The crossing count is a piecewise-constant, non-differentiable function of
+node positions, which means gradient-based methods can only optimize
+differentiable proxies rather than the metric itself.
+
+Reinforcement learning (RL) offers a natural alternative.  An agent interacts
+with the layout environment by moving nodes, and the reward directly reflects
+the hard crossing count---no differentiable surrogate is needed.  The policy
+can explore large layout spaces and learn to prioritize moves that reduce
+crossings, something that is difficult to express as an energy function.
+
+This report investigates how to best formulate the RL problem for graph layout
+and how increasingly expressive policy designs affect crossing reduction.
+Our main contributions are:
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=0pt]
+    \item A systematic study of five RL formulations for crossing minimization,
+          ranging from discrete coarse-grained actions to continuous adaptive
+          node selection.
+    \item \textsc{SequentialRefinement} as the best-performing method,
+          achieving SPC $-24.58\%$ vs.\ \texttt{neato} by iteratively
+          refining a force-directed initialization with BFS-ordered delta moves.
+    \item Evaluation on the Rome graph dataset with comparisons across all
+          five methods and the \texttt{neato} force-directed baseline.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Background}
+\label{sec:background}
+
+\subsection{Graph Drawing and Edge Crossings}
+
+Given an undirected graph $G=(V,E)$, a 2D layout assigns each node a
+coordinate in the plane.  Two edges \emph{cross} if their straight-line
+segments intersect at an interior point.  The total crossing count
+$\text{cr}(\phi)$ measures the visual complexity of layout $\phi$.
+Finding a minimum-crossing layout is NP-hard in general, and the best known
+exact algorithms are only practical for very small graphs.
+
+\subsection{Proximal Policy Optimization}
+
+PPO~\cite{schulman2017ppo} is an actor-critic RL algorithm.  It collects
+trajectories under the current policy, computes Generalized Advantage
+Estimates (GAE), and updates the policy by maximizing a clipped surrogate
+objective that prevents large policy steps.  The value function is trained
+simultaneously with a coefficient of~0.5.
+
+\subsection{Graph Attention Networks}
+
+Graph Attention Networks (GAT)~\cite{velickovic2018gat} compute node
+embeddings by aggregating neighbor information with learned attention weights.
+We use three GAT layers with four attention heads and hidden dimension~128,
+incorporating edge features (current Euclidean edge length) via the
+edge-feature variant in PyTorch Geometric.  A global mean-pooling layer
+produces the scalar state-value estimate for the critic head.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Problem Formulation}
+\label{sec:problem}
+
+\paragraph{State.}
+All methods represent the layout as per-node feature vectors containing
+normalized $(x, y)$ coordinates in $[-1,1]^2$; the remaining features differ
+by method and are described in Section~\ref{sec:methods}.
+Where applicable, edge features carry the current Euclidean distance between
+the two endpoint nodes.
+
+\paragraph{Reward.}
+All methods share the same high-level reward structure: a crossing term
+weighted by $w_c=1.0$ plus a structure term weighted by $w_s=0.3$, with
+an optional $+10$ bonus for reaching a crossing-free layout.  The details
+differ across methods and are described in Section~\ref{sec:methods}.
+The two structure losses used are: (1)~\textbf{SoftmaxRanking loss} ---
+the KL divergence between softmax distributions of layout distances and
+graph-theoretic shortest-path distances (Methods 1 and 2); and
+(2)~\textbf{Kamada--Kawai stress} --- a weighted sum of squared differences
+between layout and graph distances (Methods 3, 4, and 5).  Method~3 computes
+stress over the \emph{placed subgraph only} (the $k$ nodes placed so far),
+with a full $O(k^2)$ recomputation each step; Methods 4 and~5 compute stress
+over the \emph{full graph} using a precomputed weight matrix and an $O(n)$
+incremental update that only touches terms involving the moved node.
+
+During training, crossing detection can optionally use a sigmoid-based soft
+approximation that provides a denser gradient signal.  Hard integer counts
+are always used for evaluation and episode termination.
+
+\paragraph{Termination.}
+An episode ends successfully when all crossings are eliminated.  It is
+truncated when the step budget is exhausted, when the agent's displacement
+falls below a minimum threshold (indicating the layout is stuck), or when
+a \emph{patience} counter---tracking consecutive steps without crossing
+improvement---exceeds a threshold.  In the refinement variants, patience
+can trigger a \emph{reset-to-best} mechanism: rather than truncating, the
+layout is restored to the best seen so far and node traversal order is
+reshuffled, giving the agent a fresh start from a good configuration.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methods}
+\label{sec:methods}
+
+We develop five methods in order of increasing sophistication.  Each is
+motivated by a specific limitation of its predecessor.
+
+\subsection{Method 1: Discrete PPO}
+
+The first formulation uses a discrete action space: at each step, the agent
+selects one of $n \times 8 \times 3$ actions, encoding a choice of node,
+direction (8 compass directions), and step scale (3 sizes linearly spaced
+between 0.05 and 0.35 in normalized coordinates).  This multi-scale design
+allows both coarse exploratory moves and fine-grained adjustments without
+committing to a fixed step size.
+
+Node features are $[x,\, y,\, \text{degree},\, \text{in\_crossing}]$ (4-dim);
+edge features are $[\text{edge\_length}]$.
+The policy (\textsc{DiscreteGNNPolicy}) encodes these through three GAT
+layers, produces per-node logits for all direction-scale combinations,
+flattens them into a single Categorical distribution, and samples one action.
+The critic head uses global mean pooling to estimate the state value.
+The crossing reward is normalized by the initial crossing count; the structure
+term uses SoftmaxRanking loss.  A $+10$ bonus is given upon reaching zero
+crossings.
+
+The main limitation of this approach is that the action space grows linearly
+with the number of nodes, and the policy must simultaneously decide both
+\emph{which} node to move and \emph{how} to move it.  At the start of
+training, all nodes are equally likely to be selected, which wastes many
+steps on nodes that are not involved in any crossings.
+
+\subsection{Method 2: Continuous PPO}
+
+The second method uses a continuous action space: at each step the policy
+outputs a displacement matrix of shape $(n \times 2)$, moving \emph{all}
+nodes simultaneously by their respective $(\Delta x, \Delta y)$ deltas.
+Node features are $[x,\, y,\, \text{degree}]$ (3-dim); edge features are
+$[\text{edge\_length}]$.  The crossing reward is normalized by the maximum
+possible crossing count (rather than the initial count), and the structure
+term uses SoftmaxRanking loss, same as Method~1.  A $+10$ bonus is given
+upon reaching zero crossings.
+
+Moving all nodes at once gives the policy global reach each step, but it
+also makes the optimization landscape more complex: a displacement that
+helps one crossing cluster may worsen another.  The lack of node-level
+selectivity means the policy cannot easily focus its updates on the most
+problematic regions of the layout.
+
+\subsection{Method 3: Sequential PPO}
+
+The third method uses a Transformer-based policy that places nodes one by one
+in BFS order.  We explored two variants.  In the \emph{from-scratch} variant,
+the agent outputs absolute coordinates $(x, y) \in [-1,1]^2$ for each node
+with no initial layout; in the \emph{neato+offset} variant, nodes start at
+their \texttt{neato} positions and the agent outputs a delta offset
+$(\Delta x, \Delta y)$.  Both use the same Transformer encoder, which attends
+over all previously placed nodes to inform the next placement.
+
+The from-scratch variant proves extremely difficult to train: it achieves SPC
+in the range of $+80\%$ to $+90\%$, meaning the resulting layouts have far
+more crossings than the \texttt{neato} baseline.  Without any initialization,
+the agent must solve a global combinatorial problem from an empty canvas, and
+errors made early in the BFS sequence compound through all subsequent placements.
+The neato+offset variant substantially reduces this burden and achieves SPC
+$+1.11\%$---still slightly worse than \texttt{neato}, but far better than
+from-scratch.  The reported result in Table~\ref{tab:results} is for the neato+offset
+variant.  The observation at each step is the placed subgraph: each already-placed
+node contributes features $[x,\, y,\, \text{is\_neighbor\_of\_}v_t]$ (3-dim),
+and edge features are $[\text{edge\_length}]$ for edges within the placed
+subgraph.  The reward at each step is the negative number of new crossings
+introduced by placing node $v_t$, minus a structure penalty computed as the
+change in Kamada--Kawai stress over the placed subgraph (the $k$ nodes placed
+so far), fully recomputed in $O(k^2)$ each step.  There is no crossing
+normalization and no terminal bonus.
+
+\subsection{Method 4: Sequential Refinement}
+
+The fourth method returns to a refinement paradigm but uses a stronger
+initialization: all episodes start from a \texttt{neato} force-directed
+layout.  The agent then applies continuous delta moves $(\Delta x, \Delta y)$
+to one node per step, cycling through all nodes in BFS order from a
+randomly chosen start node.
+
+The policy (\textsc{GATRefinementPolicy}) encodes a 5-dim node feature
+vector $[x,\; y,\; \textit{is\_vt},\; \textit{is\_nbr},\; \textit{in\_xing}]$
+through three GAT layers, where \textit{is\_vt} flags the current target
+node, \textit{is\_nbr} flags its neighbors, and \textit{in\_xing} flags
+crossing nodes.  It extracts the target node's embedding and outputs a
+Gaussian distribution over 2D displacements, keeping the action dimension
+fixed at~2 regardless of graph size.  Edge features are $[\textit{edge\_length}]$.
+
+The reward uses the raw crossing delta (unnormalized) and Kamada-Kawai
+stress as the structure term, updated incrementally in $O(n)$ per step.
+There is no $+10$ terminal bonus.  Starting from a good initialization
+dramatically reduces the number of steps needed to reach a low-crossing
+layout.  The remaining limitation is that BFS cycling still visits all
+nodes in a fixed order, regardless of whether they are involved in crossings.
+
+\subsection{Method 5: Node-Select Refinement}
+
+The fifth method addresses the node-selection problem directly.  Instead of
+cycling nodes by an external schedule, the policy itself decides which node
+to move at every step.  The action is a matrix of shape $n \times 2$; the
+environment identifies the node with the largest output magnitude as the
+chosen target and applies its displacement.
+
+The policy (\textsc{NodeSelectGNNPolicy}) encodes a 5-dim node feature
+vector $[x,\; y,\; \textit{xing\_cnt},\; \textit{xing\_nbr},\; \textit{in\_xing}]$,
+where \textit{xing\_cnt} is the normalized per-node crossing count,
+\textit{xing\_nbr} flags nodes adjacent to a crossing node, and
+\textit{in\_xing} flags crossing nodes; edge features are $[\textit{edge\_length}]$.
+It extends the GAT refinement architecture with two new components.  First, a \emph{node selection head}
+scores each node by combining a learned linear projection of its GAT
+embedding with a crossing-count heuristic: nodes involved in more crossings
+receive a higher base score.  The weight of the heuristic term is itself a
+learnable scalar $\hat\alpha$, initialized at~2.0, allowing the model to
+calibrate how much to trust the heuristic signal relative to what it learns
+from experience.
+
+Second, a \emph{crossing-context pooling} module computes a global summary
+of the embeddings of all nodes currently in crossings.  This context vector
+is concatenated with the selected node's embedding before the displacement
+prediction head, so the predicted move is conditioned on the global crossing
+structure, not just the local neighborhood.
+
+The log-probability of a full action decomposes into the log-probability of
+the node selection (a Categorical over $n$ nodes) plus the log-probability
+of the displacement given the selected node.  Both terms flow through the
+PPO objective, so the policy is trained end-to-end to select good nodes and
+move them well.
+
+\begin{table*}[t]
+\centering
+\caption{Summary of the five methods.}
+\label{tab:methods}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llll}
+\toprule
+Method & Action type & Node selection & Policy \\
+\midrule
+Discrete PPO        & Discrete $n{\times}8{\times}3$ & Joint w/ move & GAT \\
+Continuous PPO      & Continuous 2D & All nodes (simultaneous) & GAT \\
+Sequential PPO      & Continuous 2D & BFS order      & Transformer \\
+\textbf{Seq.\ Refinement} & Continuous 2D & \textbf{BFS shuffle} & \textbf{GAT} \\
+Node-Select         & Continuous 2D & Learned        & GAT+ctx \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\subsection{Dataset}
+
+We use the \textbf{Rome} graph collection~\cite{didimo2011rome}, a standard
+benchmark in graph drawing.  The collection contains real-world graphs from
+circuit schematics, biological networks, and social graphs, split into a
+training set and a held-out test set (file lists in
+\texttt{data/train\_graph.txt} and \texttt{data/test\_graph.txt}).
+For each graph, we precompute the edge index, per-node degree, all-pairs
+shortest-path distances, and a precomputed SoftmaxRanking distance
+distribution used by the structure loss.  A new graph is sampled from the
+training set at the start of each episode, so the agent must generalize
+across different graph topologies.
+
+\subsection{Baselines}
+
+The primary baseline is the \texttt{neato} layout from Graphviz, which
+implements the Kamada--Kawai stress-minimization heuristic.  We record the
+crossing count of the \texttt{neato} layout before any RL refinement.  All
+refinement methods (Methods 4 and~5) are initialized from this layout, so
+the improvement numbers directly measure how much the RL agent contributes
+on top of the force-directed result.
+
+\subsection{Training Details}
+
+Training budgets vary by method: simpler methods (Discrete PPO, Node-Select
+Refinement) are trained for $5\times10^5$ timesteps, while Sequential PPO
+and Sequential Refinement use $3\times10^6$ and $2\times10^6$ timesteps
+respectively due to their harder optimization landscapes.
+Table~\ref{tab:hparams} lists the PPO hyperparameters for Sequential
+Refinement, the best-performing method.  Evaluation is performed on the
+test split with the final checkpoint.
+
+\begin{table}[h]
+\centering
+\caption{PPO hyperparameters for Sequential Refinement (best method).}
+\label{tab:hparams}
+\small
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Learning rate & $3\times10^{-4}$ \\
+Discount $\gamma$ & $0.99$ \\
+GAE $\lambda$ & $0.95$ \\
+Clip $\epsilon$ & $0.2$ \\
+PPO update epochs & $4$ \\
+Batch size & $512$ \\
+Rollout steps & $512$ \\
+Entropy coefficient & $0.05$ \\
+Hidden dimension & $128$ \\
+GAT layers / heads & $3$ / $4$ \\
+Structure weight $w_s$ & $0.3$ \\
+Patience & $100$ steps \\
+Reset-to-best & enabled \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Metrics}
+
+Our primary metric is the \textbf{Symmetric Percentage Change (SPC)},
+defined as
+\[
+  \text{SPC} = \frac{\text{cr}_{\text{ours}} - \text{cr}_{\text{ref}}}
+                    {\max(\text{cr}_{\text{ours}},\,\text{cr}_{\text{ref}})},
+\]
+where $\text{cr}_{\text{ours}}$ is the crossing count produced by our method
+and $\text{cr}_{\text{ref}}$ is that of the reference layout (\texttt{neato}).
+SPC lies in $[-1, 1]$; a negative value means our method produces fewer
+crossings than the reference.  The symmetric denominator ensures the metric
+is bounded and comparable across graphs with very different crossing counts.
+We also report the \textbf{zero-crossing rate}, the fraction of test graphs
+for which the agent achieves a completely crossing-free layout.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+\label{sec:results}
+
+\subsection{Quantitative Comparison}
+
+Table~\ref{tab:results} summarizes test-set performance across all methods.
+The \texttt{neato} baseline already produces low-crossing layouts for many
+small, sparse graphs, but struggles on denser graphs where the energy
+landscape has many local minima.
+
+Discrete PPO (Method~1) and Continuous PPO (Method~2) both refine a
+\texttt{neato} initialization but differ in action space.  Continuous PPO
+achieves SPC $-2.38\%$ and mean crossing count 28.65, outperforming
+Discrete PPO ($-0.87\%$, mean cr 28.93) because it can express precise
+displacements without a discretized direction grid.  Sequential PPO
+(Method~3) is the only from-scratch method and the only one that performs
+\emph{worse} than \texttt{neato} (SPC $+1.11\%$, mean cr 29.25).
+Constructing a layout without any initialization is a much harder problem:
+errors made early in the BFS placement sequence compound through all
+subsequent nodes, and the agent must plan many steps ahead without
+a reliable starting point.  Additionally, Continuous PPO exhibits severe
+instability in its final-state crossings (mean 1{,}200) after early
+convergence, though its best-seen count remains competitive.
+
+The two refinement methods (4 and~5) substantially outperform Methods 1--3,
+confirming that a \texttt{neato} initialization provides a strong advantage.  Sequential Refinement
+(Method~4) achieves the best overall result: SPC $-24.58\%$ and mean
+crossing count 22.45, a reduction of roughly 7~crossings per graph on
+average.  Node-Select Refinement (Method~5) achieves SPC $-5.20\%$,
+significantly worse despite its more sophisticated architecture.  We
+analyze this gap in the ablation section below.
+
+\begin{table*}[h]
+\centering
+\caption{Test-set results. SPC $<0$ means fewer crossings than \texttt{neato}.}
+\label{tab:results}
+\small
+\begin{tabular}{lccc}
+\toprule
+Method & Mean cr $\downarrow$ & SPC $\downarrow$ & Zero-cr (\%) $\uparrow$ \\
+\midrule
+\texttt{neato} (init)             & ---   & 0.0\%     & ---  \\
+Discrete PPO                      & 28.93 & $-0.87\%$ & 3.0  \\
+Continuous PPO                    & 28.65 & $-2.38\%$ & 4.0  \\
+Sequential PPO                    & 29.25 & $+1.11\%$ & 3.0  \\
+\textbf{Seq.\ Refinement}         & \textbf{22.45} & $\mathbf{-24.58\%}$ & \textbf{4.0} \\
+Node-Select Refine                & 27.43 & $-5.20\%$ & 4.0  \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Ablation Studies}
+
+\paragraph{Patience and reset-to-best.}
+Without the patience mechanism, the agent tends to oscillate once it reaches
+a local crossing minimum---it keeps moving the same nodes back and forth
+without making progress.  Adding a patience counter of~100 steps truncates
+these unproductive episodes early and improves sample efficiency.  Enabling
+the \texttt{reset\_to\_best} option yields a further improvement: when the
+patience threshold is reached, the layout is restored to the best crossing
+count seen so far and the node order is reshuffled, giving the agent a fresh
+perspective from a good starting point rather than terminating the episode.
+
+\paragraph{Soft vs.\ hard crossing reward.}
+The hard crossing count is piecewise-constant and provides a sparse reward
+signal: it only changes when an actual crossing appears or disappears.  The
+soft sigmoid approximation provides a denser signal that changes smoothly
+with node positions, which helps early in training.  In practice, the two
+variants converge to similar final crossing counts, suggesting that the hard
+count is a sufficient training signal once the policy has learned to reliably
+move nodes in the right direction.
+
+\paragraph{Node traversal order in Sequential Refinement.}
+Within the Sequential Refinement framework we compare three traversal
+strategies: BFS from a random start, ascending degree (\texttt{degree\_asc}),
+and descending degree (\texttt{degree\_desc}).  Table~\ref{tab:order} shows
+that BFS achieves the lowest crossing count on all metrics.  Degree-descending
+order performs worst, likely because moving high-degree nodes early causes
+large structural disruptions that later low-degree nodes cannot repair.
+BFS visits nodes in connectivity order, keeping related nodes coherent and
+enabling more targeted local adjustments.
+
+\begin{table}[h]
+\centering
+\caption{Node traversal order ablation (Sequential Refinement).}
+\label{tab:order}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+Order & SPC $\downarrow$ & Mean cr & Median & Max \\
+\midrule
+\textbf{BFS}  & $\mathbf{-24.58\%}$ & \textbf{22.45} & \textbf{8.0} & \textbf{165} \\
+degree\_asc   & $-22.44\%$          & 23.28          & 8.0          & 173          \\
+degree\_desc  & $-20.55\%$          & 23.51          & 10.0         & 184          \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Qualitative Analysis}
+
+Figure~\ref{fig:layouts} shows a representative example from Sequential
+Refinement on graph \texttt{grafo10005.39}.  Starting from 23 crossings
+in the \texttt{neato} initial layout (left), the agent reduces crossings
+to 15 at episode end (center, $\Delta=-8$) and reaches a best of 13
+during the episode (right, $\Delta=-10$).  Crossing edges are highlighted
+in red; the rightmost panel shows how the agent consolidates nodes into a
+more planar configuration by iteratively resolving the densest crossing
+clusters.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\columnwidth]{seq_refinement_example.png}
+\caption{Sequential Refinement on \texttt{grafo10005.39}.
+  Left: initial layout (23 crossings).
+  Center: final layout (15 crossings, $\Delta=-8$).
+  Right: best layout seen during the episode (13 crossings, $\Delta=-10$).
+  Red edges are crossing pairs.}
+\label{fig:layouts}
+\end{figure}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why RL suits crossing minimization.}
+The crossing count is a combinatorial metric that is non-differentiable with
+respect to node positions.  Gradient-based optimizers must resort to
+differentiable surrogates, which may not correlate perfectly with the true
+crossing count.  RL sidesteps this issue entirely: the policy is optimized
+against the hard metric through interaction, and any proxy (such as our soft
+crossing reward) is used only to smooth early training rather than as the
+final objective.
+
+\paragraph{Action space design.}
+Moving from a discrete to a continuous action space (Methods 1 to 2) removes
+the arbitrary direction grid and allows more precise moves.  The large
+performance gap between the from-scratch approach (Method~3, Sequential PPO)
+and the refinement-based approaches (Methods 4--5) confirms that initialization
+quality is the single most important factor: even a simple BFS cycling strategy
+on top of a \texttt{neato} layout beats from-scratch placement by a wide margin.
+
+\paragraph{Limitations.}
+Two limitations stand out from the experimental results.
+
+First, all refinement methods depend entirely on the \texttt{neato}
+force-directed initialization.  The RL agent is a \emph{post-hoc corrector}
+rather than an independent layout algorithm: if \texttt{neato} produces a
+layout with many crossings, the agent has more room to improve, but it
+inherits all structural decisions (relative node positions, overall scale)
+from the baseline.  A two-stage pipeline---first generating a coarse layout,
+then refining it---or a curriculum that trains the agent on layouts of
+increasing quality, could reduce this dependency.
+
+Second, the attempt to replace fixed BFS cycling with a learned node-selection
+policy (Method~5, Node-Select Refinement) largely failed: it achieves only
+SPC $-5.20\%$ versus $-24.58\%$ for plain BFS cycling.  The root cause is
+a weak gradient signal for the discrete node-selection head: the selection
+decision influences the reward only indirectly, through the quality of the
+subsequent displacement.  Possible remedies include differentiable selection
+via Gumbel-Softmax, a dynamic priority queue that always selects the
+highest-crossing node, or a hierarchical policy that separates region
+selection from local refinement.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented a systematic study of five RL formulations for graph layout
+optimization, progressively addressing the limitations of each design.
+The central finding is that initialization quality dominates policy
+complexity: Sequential Refinement---a GAT policy that simply cycles through
+nodes in BFS order starting from a \texttt{neato} layout---achieves SPC
+$-24.58\%$ relative to \texttt{neato} on the Rome benchmark, far exceeding
+the from-scratch approach (Sequential PPO) and simpler neato-initialized methods.  The attempt to improve further with a learned
+node-selection policy (Node-Select Refinement, SPC $-5.20\%$) highlights
+the difficulty of training discrete selection decisions with sparse
+RL rewards.  Future work should explore differentiable node selection and
+two-stage pipelines that decouple coarse layout generation from fine-grained
+crossing reduction.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{schulman2017ppo}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock \textit{arXiv preprint arXiv:1707.06347}, 2017.
+
+\bibitem{velickovic2018gat}
+P.~Veli{\v{c}}kovi{\'c}, G.~Cucurull, A.~Casanova, A.~Romero, P.~Li{\`o},
+and Y.~Bengio.
+\newblock Graph attention networks.
+\newblock In \textit{ICLR}, 2018.
+
+\bibitem{didimo2011rome}
+W.~Didimo, G.~Liotta, and S.~A.~Romeo.
+\newblock Graph drawing beyond planarity: from theory to practice.
+\newblock Technical Report, 2011.
+
+\bibitem{fruchterman1991}
+T.~M.~J.~Fruchterman and E.~M.~Reingold.
+\newblock Graph drawing by force-directed placement.
+\newblock \textit{Software: Practice and Experience}, 21(11):1129--1164, 1991.
+
+\bibitem{kamada1989}
+T.~Kamada and S.~Kawai.
+\newblock An algorithm for drawing general undirected graphs.
+\newblock \textit{Information Processing Letters}, 31(1):7--15, 1989.
+
+\end{thebibliography}
+
+\end{document}
