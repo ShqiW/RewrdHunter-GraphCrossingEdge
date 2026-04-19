@@ -46,6 +46,12 @@ def main():
             from src.envs.refinement import RefinementGraphEnv as ENVClass
             from src.data.GATRefinementRolloutBuffer import GATRefinementRolloutBuffer as BufferClass
             args, _ = auto_extract_args(SequentialRefinementArgs)
+        case "node_select_refinement":
+            from src.tasks.sequential_ppo import NodeSelectRefinementArgs
+            from src.models.node_select_gnn import NodeSelectGNNPolicy as ModelClass
+            from src.envs.refinement import RefinementGraphEnv as ENVClass
+            from src.data.NodeSelectRolloutBuffer import NodeSelectRolloutBuffer as BufferClass
+            args, _ = auto_extract_args(NodeSelectRefinementArgs)
         case "continuous_ppo":
             from src.tasks.continuous_ppo import ContinuousPPOArgs
             from src.models.continuous_gnn import ContinuousGNNPolicy as ModelClass

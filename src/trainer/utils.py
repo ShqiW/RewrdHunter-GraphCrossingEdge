@@ -1,7 +1,7 @@
 from src.tasks.base import BaseArgs
 
 from src.tasks.discrete_ppo import DiscretePPOArgs
-from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
+from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs, NodeSelectRefinementArgs
 from src.tasks.continuous_ppo import ContinuousPPOArgs
 
 
@@ -26,6 +26,13 @@ def create_env(
                 config=args.env,
             )
         case SequentialRefinementArgs():
+            from src.envs.refinement import RefinementGraphEnv
+            return RefinementGraphEnv(
+                graph_data=graph_data,
+                device=device,
+                config=args.env,
+            )
+        case NodeSelectRefinementArgs():
             from src.envs.refinement import RefinementGraphEnv
             return RefinementGraphEnv(
                 graph_data=graph_data,

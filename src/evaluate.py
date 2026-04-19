@@ -21,7 +21,7 @@ from src.envs.refinement import RefinementGraphEnv
 from src.models.base import BasePolicy
 from src.tasks.base import BaseArgs
 from typing import List, Dict
-from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
+from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs, NodeSelectRefinementArgs
 from src.tasks.discrete_ppo import DiscretePPOArgs
 from src.tasks.continuous_ppo import ContinuousPPOArgs
 from src.data.data import GraphData
@@ -52,6 +52,10 @@ def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
                                       device=device,
                                       config=args.env)
         case SequentialRefinementArgs():
+            return RefinementGraphEnv(graph_data=graph_data,
+                                      device=device,
+                                      config=args.env)
+        case NodeSelectRefinementArgs():
             return RefinementGraphEnv(graph_data=graph_data,
                                       device=device,
                                       config=args.env)
