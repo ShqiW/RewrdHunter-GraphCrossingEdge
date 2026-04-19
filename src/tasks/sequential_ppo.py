@@ -13,6 +13,7 @@ from src.envs.sequential import SequentialEnvConfig
 from src.envs.refinement import RefinementEnvConfig
 from src.models.transformer_policy import TransformerConfig
 from src.models.continuous_gnn import ContinuousGNNConfig
+from src.models.node_select_gnn import NodeSelectGNNConfig
 
 
 @dataclass
@@ -44,4 +45,23 @@ class SequentialRefinementArgs(BaseArgs):
     env: RefinementEnvConfig = field(default_factory=RefinementEnvConfig)
     model: ContinuousGNNConfig = field(
         default_factory=lambda: ContinuousGNNConfig(node_input_dim=5)
+    )
+
+
+@dataclass
+class NodeSelectRefinementArgs(BaseArgs):
+    """
+    Node-selecting refinement: policy learns which node to move + displacement.
+
+    CLI usage:
+        --env.structure_weight 0.3
+        --model.crossing_score_alpha 2.0
+    """
+    name: str = "node_select_refinement"
+
+    env: RefinementEnvConfig = field(
+        default_factory=lambda: RefinementEnvConfig(node_select_mode=True)
+    )
+    model: NodeSelectGNNConfig = field(
+        default_factory=lambda: NodeSelectGNNConfig(node_input_dim=5)
     )

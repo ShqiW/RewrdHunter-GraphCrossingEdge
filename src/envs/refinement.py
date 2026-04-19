@@ -30,6 +30,7 @@ class RefinementEnvConfig(BaseEnvConfig):
     exclude_non_crossing: bool = False  # focus only on nodes involved in crossings
     order_method: str = "bfs"
     delta_scale: float = 0.1  # max offset per step in [-1, 1]² space
+    node_select_mode: bool = False  # policy selects which node to move (action=[n,2])
     # Patience: truncate if crossings have not improved for this many steps.
     # Set to 0 to disable.
     patience: int = 100
@@ -115,10 +116,17 @@ class RefinementGraphEnv(BaseGraphEnv):
         ]
 
         # ── Spaces ─────────────────────────────────────────────────────────────
-        self.action_space = spaces.Box(low=-1.0,
-                                       high=1.0,
-                                       shape=(2, ),
-                                       dtype=np.float32)
+        if config.node_select_mode:
+            # policy outputs [n, 2]; env picks node with highest action norm
+            self.action_space = spaces.Box(low=-1.0,
+                                           high=1.0,
+                                           shape=(self.num_nodes, 2),
+                                           dtype=np.float32)
+        else:
+            self.action_space = spaces.Box(low=-1.0,
+                                           high=1.0,
+                                           shape=(2, ),
+                                           dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf,
                                             high=np.inf,
                                             shape=(self.num_nodes, 5),
@@ -186,17 +194,41 @@ class RefinementGraphEnv(BaseGraphEnv):
         ).item()
 
     def _build_obs(self) -> np.ndarray:
-        vt = self.node_order[self.step_idx % len(self.node_order)]
-        neighbors = set(self.adj[vt])
         crossing_nodes = set(self._get_nodes_in_crossings())
         features = np.zeros((self.num_nodes, 5), dtype=np.float32)
         features[:, 0:2] = self.coords
-        features[vt, 2] = 1.0
-        for nb in neighbors:
-            features[nb, 3] = 1.0
-        for cn in crossing_nodes:
-            features[cn, 4] = 1.0
+
+        if self.config.node_select_mode:
+            # feature[2]: per-node crossing count (normalized)
+            # feature[3]: has a neighbor in crossings
+            # feature[4]: node itself is in a crossing (binary)
+            node_xing_count = self._get_crossing_count_per_node()
+            total = node_xing_count.sum()
+            features[:, 2] = node_xing_count / (total + 1e-6)
+            for cn in crossing_nodes:
+                features[cn, 4] = 1.0
+                for nb in self.adj[cn]:
+                    features[nb, 3] = 1.0
+        else:
+            vt = self.node_order[self.step_idx % len(self.node_order)]
+            neighbors = set(self.adj[vt])
+            features[vt, 2] = 1.0
+            for nb in neighbors:
+                features[nb, 3] = 1.0
+            for cn in crossing_nodes:
+                features[cn, 4] = 1.0
         return features
+
+    def _get_crossing_count_per_node(self) -> np.ndarray:
+        """Per-node count of crossings (each crossing counted for both endpoint nodes)."""
+        _, mask = self.gls.compute_crossings()  # mask: [E, E] bool upper-tri
+        node_count = np.zeros(self.num_nodes, dtype=np.float32)
+        # mask[i,j]=True means edge i crosses edge j
+        crossing_edges = np.where(mask.any(axis=1) | mask.any(axis=0))[0]
+        for e_idx in crossing_edges:
+            for node in self.gls.edges[e_idx].tolist():
+                node_count[node] += 1.0
+        return node_count
 
     def _build_edge_index(self) -> np.ndarray:
         src, dst = [], []
@@ -244,15 +276,28 @@ class RefinementGraphEnv(BaseGraphEnv):
         }
 
     def step(self, action: np.ndarray):
-        if not self.node_order or self.step_idx >= self.config.max_steps:
+        if self.step_idx >= self.config.max_steps:
             return self._build_obs(), 0.0, False, True, {
                 "step": self.step_idx,
                 "total_crossings": self.total_crossings,
             }
 
-        vt = self.node_order[self.step_idx % len(self.node_order)]
+        if self.config.node_select_mode:
+            # action: [n, 2] — pick node with highest displacement magnitude
+            norms = np.linalg.norm(action, axis=-1)  # [n]
+            vt = int(np.argmax(norms))
+            delta = action[vt]  # [2]
+        else:
+            if not self.node_order:
+                return self._build_obs(), 0.0, False, True, {
+                    "step": self.step_idx,
+                    "total_crossings": self.total_crossings,
+                }
+            vt = self.node_order[self.step_idx % len(self.node_order)]
+            delta = action  # [2]
+
         old_pos = self.gls.positions[vt].copy()
-        new_pos = (old_pos + action * self.delta_scale).astype(np.float64)
+        new_pos = (old_pos + delta * self.delta_scale).astype(np.float64)
 
         # Stress delta must be computed before updating vt's position
         ds = 0.0

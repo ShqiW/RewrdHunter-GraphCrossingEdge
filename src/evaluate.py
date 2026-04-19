@@ -21,7 +21,7 @@ from src.envs.refinement import RefinementGraphEnv
 from src.models.base import BasePolicy
 from src.tasks.base import BaseArgs
 from typing import List, Dict
-from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs
+from src.tasks.sequential_ppo import SequentialPPOArgs, SequentialRefinementArgs, NodeSelectRefinementArgs
 from src.tasks.discrete_ppo import DiscretePPOArgs
 from src.tasks.continuous_ppo import ContinuousPPOArgs
 from src.data.data import GraphData
@@ -52,6 +52,10 @@ def _make_env(graph_data: GraphData, device, args: BaseArgs) -> BaseGraphEnv:
                                       device=device,
                                       config=args.env)
         case SequentialRefinementArgs():
+            return RefinementGraphEnv(graph_data=graph_data,
+                                      device=device,
+                                      config=args.env)
+        case NodeSelectRefinementArgs():
             return RefinementGraphEnv(graph_data=graph_data,
                                       device=device,
                                       config=args.env)
@@ -271,6 +275,7 @@ def evaluate(
             "graph_name": graph_data.graph_name,
             "num_nodes": graph_data.num_nodes,
             "num_edges": graph_data.edge_index.shape[1] // 2,
+            "node_ids": graph_data.node_ids,
             **outputs,
         })
 
@@ -280,9 +285,25 @@ def evaluate(
     df = pd.DataFrame(results)
     keys = [
         x for x in df.columns
-        if "coords" not in x and x not in ("frames", "graph")
+        if "coords" not in x and x not in ("frames", "graph", "node_ids")
     ]
     df[keys].to_csv(out / "results.csv", index=False)
+
+    # ── save best_coords per graph ─────────────────────────────────────────────
+    coords_dir = out / "coords"
+    coords_dir.mkdir(exist_ok=True)
+    for r in results:
+        fname = coords_dir / f"{r['graph_name']}.coord"
+        node_ids = r.get("node_ids")
+        coords = r["coords"]
+        if node_ids is not None:
+            # sort rows by numeric part of node ID (n0, n1, n2, ..., n10, n11, ...)
+            rows = sorted(zip(node_ids, coords), key=lambda t: int(t[0][1:]))
+            with open(fname, "w") as f:
+                for nid, (x, y) in rows:
+                    f.write(f"{nid} {x:.6f} {y:.6f}\n")
+        else:
+            np.savetxt(fname, coords, fmt="%.6f")
 
     # ── save CSV ───────────────────────────────────────────────────────────────
     # out.mkdir(parents=True, exist_ok=True)

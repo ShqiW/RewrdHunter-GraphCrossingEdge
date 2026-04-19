@@ -15,3 +15,4 @@ class GraphData:
     graph_name: str
     neato_coords: torch.Tensor  # [num_nodes, 2] raw neato layout (unnormalized)
     neato_xing: int  # crossing count on raw neato layout
+    node_ids: list = None  # original node labels (e.g. ["n0","n1","n10",...]) in integer-index order
