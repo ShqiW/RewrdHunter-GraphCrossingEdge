@@ -20,7 +20,7 @@ from src.data.data import GraphData
 from src.envs.gat_env import GATGraphEnv
 from src.tasks.base import BaseEnvConfig
 
-# 8 direction unit vectors (normalised)
+# 8 direction unit vectors (normalized)
 DIRECTIONS = np.array(
     [[0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1], [-1, 0], [-1, 1]],
     dtype=np.float32,
@@ -37,11 +37,11 @@ class DiscreteEnvConfig(BaseEnvConfig):
     structure_method: str = "softmax"
     softmax_tau: Optional[float] = 1
     use_potential_shaping: bool = False
-    # 多尺度步长：agent 可以选择粗/中/细三档移动幅度
+    # Multi-scale step sizes: agent can choose coarse/medium/fine movement magnitude
     num_scales: int = 3
     scale_min: float = 0.05
     scale_max: float = 0.35
-    # Patience：连续 N 步交叉数没有改善则截断，防止横跳。0 表示禁用
+    # Patience: truncate if crossings have not improved for N consecutive steps, to prevent oscillation. 0 disables it
     patience: int = 50
 
 

@@ -138,7 +138,7 @@ class GATGraphEnv(BaseGraphEnv):
         return np.linalg.norm(diff, axis=1).astype(np.float32)
 
     def _get_crossing_node_mask(self) -> np.ndarray:
-        """返回 [N] float32，节点是否参与至少一个交叉边。"""
+        """Return [N] float32 indicating whether each node is involved in at least one crossing edge."""
         _, crossing_matrix = self.gls.compute_crossings()  # (E, E) bool
         involved = np.where(
             crossing_matrix.any(axis=1) | crossing_matrix.any(axis=0)

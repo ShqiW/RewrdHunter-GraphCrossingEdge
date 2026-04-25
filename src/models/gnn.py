@@ -28,7 +28,7 @@ class GNNConfig(BasePPOConfig):
     edge_input_dim: int = 1  # edge_length
     num_heads: int = 4
     dropout: float = 0.1
-    num_scales: int = 3  # 多尺度步长档数，与 DiscreteEnvConfig.move_scales 对应
+    num_scales: int = 3  # Number of multi-scale step sizes, corresponding to DiscreteEnvConfig.move_scales
 
 
 class DiscreteGNNPolicy(BasePolicy):
@@ -80,7 +80,7 @@ class DiscreteGNNPolicy(BasePolicy):
                 ))
 
         # Action head: each node outputs (8 * num_scales) logits
-        # 前 8 对应方向，每个方向有 num_scales 档步长
+        # The first 8 correspond to directions; each direction has num_scales step sizes
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
