@@ -2,10 +2,10 @@
 Standalone script: visualize before/after layouts for top-N test graphs.
 
 Usage:
-  # 默认参数
+  # default parameters
   poetry run python scripts/23_visualize_layouts.py
 
-  # 指定不同的 checkpoint 和 data
+  # specify a different checkpoint and data
   poetry run python scripts/23_visualize_layouts.py \
     --checkpoint checkpoints/rome_multi/checkpoint_1400.pt \
     --data_root data \

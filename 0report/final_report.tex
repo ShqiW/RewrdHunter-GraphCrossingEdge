@@ -29,7 +29,7 @@ continuous-action and sequential placement formulations, and culminating in a
 GAT-based iterative refinement policy that cycles through nodes in BFS order
 with continuous delta moves.  All methods are trained and evaluated on the
 Rome graph benchmark against a \texttt{neato} force-directed baseline.
-Our best method, Sequential Refinement, achieves an SPC of $-24.58\%$
+Our best method, Sequential Refinement, achieves an SPC of $-24.43\%$
 relative to \texttt{neato}, demonstrating that iterative local refinement
 from a strong initialization substantially outperforms both from-scratch
 placement and global discrete-action approaches.
@@ -66,7 +66,7 @@ Our main contributions are:
           ranging from discrete coarse-grained actions to continuous adaptive
           node selection.
     \item \textsc{SequentialRefinement} as the best-performing method,
-          achieving SPC $-24.58\%$ vs.\ \texttt{neato} by iteratively
+          achieving SPC $-24.43\%$ vs.\ \texttt{neato} by iteratively
           refining a force-directed initialization with BFS-ordered delta moves.
     \item Evaluation on the Rome graph dataset with comparisons across all
           five methods and the \texttt{neato} force-directed baseline.
@@ -249,12 +249,12 @@ to move at every step.  The action is a matrix of shape $n \times 2$; the
 environment identifies the node with the largest output magnitude as the
 chosen target and applies its displacement.
 
-The policy (\textsc{NodeSelectGNNPolicy}) encodes a 5-dim node feature
+The policy (\textsc{Node\-Select\-GNN\-Policy}) encodes a 5-dim node feature
 vector $[x,\; y,\; \textit{xing\_cnt},\; \textit{xing\_nbr},\; \textit{in\_xing}]$,
 where \textit{xing\_cnt} is the normalized per-node crossing count,
 \textit{xing\_nbr} flags nodes adjacent to a crossing node, and
 \textit{in\_xing} flags crossing nodes; edge features are $[\textit{edge\_length}]$.
-It extends the GAT refinement architecture with two new components.  First, a \emph{node selection head}
+It extends the GAT refinement architecture with two new components, as follows.  First, a \emph{node selection head}
 scores each node by combining a learned linear projection of its GAT
 embedding with a crossing-count heuristic: nodes involved in more crossings
 receive a higher base score.  The weight of the heuristic term is itself a
@@ -285,7 +285,7 @@ move them well.
 Method & Action type & Node selection & Policy \\
 \midrule
 Discrete PPO        & Discrete $n{\times}8{\times}3$ & Joint w/ move & GAT \\
-Continuous PPO      & Continuous 2D & All nodes (simultaneous) & GAT \\
+Continuous PPO      & Continuous 2D & All (parallel) & GAT \\
 Sequential PPO      & Continuous 2D & BFS order      & Transformer \\
 \textbf{Seq.\ Refinement} & Continuous 2D & \textbf{BFS shuffle} & \textbf{GAT} \\
 Node-Select         & Continuous 2D & Learned        & GAT+ctx \\
@@ -384,22 +384,25 @@ landscape has many local minima.
 
 Discrete PPO (Method~1) and Continuous PPO (Method~2) both refine a
 \texttt{neato} initialization but differ in action space.  Continuous PPO
-achieves SPC $-2.38\%$ and mean crossing count 28.65, outperforming
-Discrete PPO ($-0.87\%$, mean cr 28.93) because it can express precise
-displacements without a discretized direction grid.  Sequential PPO
-(Method~3) is the only from-scratch method and the only one that performs
-\emph{worse} than \texttt{neato} (SPC $+1.11\%$, mean cr 29.25).
-Constructing a layout without any initialization is a much harder problem:
-errors made early in the BFS placement sequence compound through all
-subsequent nodes, and the agent must plan many steps ahead without
-a reliable starting point.  Additionally, Continuous PPO exhibits severe
-instability in its final-state crossings (mean 1{,}200) after early
-convergence, though its best-seen count remains competitive.
+achieves SPC $-2.38\%$ and mean best-crossing count 28.65, outperforming
+Discrete PPO ($-0.87\%$, mean best-cr 28.93) because it can express precise
+displacements without a discretized direction grid.  However, Continuous PPO
+exhibits severe instability: its mean final-state crossing count is~1{,}200,
+far above its best-seen count of 28.65, indicating that the policy continues
+to degrade the layout after reaching its best configuration.
+
+The BFS placement approach (Method~3) is the only one that performs
+\emph{worse} than \texttt{neato} (SPC $+1.11\%$, mean best-cr 29.25).
+Even with a \texttt{neato} initialization, BFS sequential placement still
+falls slightly short: each node is placed in turn and the Transformer must
+predict a good position using only the already-placed subgraph, so
+early placement errors compound through all subsequent nodes and the
+agent cannot revise earlier decisions.
 
 The two refinement methods (4 and~5) substantially outperform Methods 1--3,
 confirming that a \texttt{neato} initialization provides a strong advantage.  Sequential Refinement
-(Method~4) achieves the best overall result: SPC $-24.58\%$ and mean
-crossing count 22.45, a reduction of roughly 7~crossings per graph on
+(Method~4) achieves the best overall result: SPC $-24.43\%$ and mean
+crossing count 22.30, a reduction of roughly 7~crossings per graph on
 average.  Node-Select Refinement (Method~5) achieves SPC $-5.20\%$,
 significantly worse despite its more sophisticated architecture.  We
 analyze this gap in the ablation section below.
@@ -411,13 +414,13 @@ analyze this gap in the ablation section below.
 \small
 \begin{tabular}{lccc}
 \toprule
-Method & Mean cr $\downarrow$ & SPC $\downarrow$ & Zero-cr (\%) $\uparrow$ \\
+Method & Mean best-cr $\downarrow$ & SPC $\downarrow$ & Zero-cr (\%) $\uparrow$ \\
 \midrule
 \texttt{neato} (init)             & ---   & 0.0\%     & ---  \\
 Discrete PPO                      & 28.93 & $-0.87\%$ & 3.0  \\
 Continuous PPO                    & 28.65 & $-2.38\%$ & 4.0  \\
 Sequential PPO                    & 29.25 & $+1.11\%$ & 3.0  \\
-\textbf{Seq.\ Refinement}         & \textbf{22.45} & $\mathbf{-24.58\%}$ & \textbf{4.0} \\
+\textbf{Seq.\ Refinement}         & \textbf{22.30} & $\mathbf{-24.43\%}$ & \textbf{4.0} \\
 Node-Select Refine                & 27.43 & $-5.20\%$ & 4.0  \\
 \bottomrule
 \end{tabular}
@@ -464,7 +467,7 @@ enabling more targeted local adjustments.
 \toprule
 Order & SPC $\downarrow$ & Mean cr & Median & Max \\
 \midrule
-\textbf{BFS}  & $\mathbf{-24.58\%}$ & \textbf{22.45} & \textbf{8.0} & \textbf{165} \\
+\textbf{BFS}  & $\mathbf{-24.43\%}$ & \textbf{22.30} & \textbf{8.0} & \textbf{171} \\
 degree\_asc   & $-22.44\%$          & 23.28          & 8.0          & 173          \\
 degree\_desc  & $-20.55\%$          & 23.51          & 10.0         & 184          \\
 \bottomrule
@@ -509,13 +512,13 @@ final objective.
 \paragraph{Action space design.}
 Moving from a discrete to a continuous action space (Methods 1 to 2) removes
 the arbitrary direction grid and allows more precise moves.  The large
-performance gap between the from-scratch approach (Method~3, Sequential PPO)
+performance gap between the BFS placement approach (Method~3)
 and the refinement-based approaches (Methods 4--5) confirms that initialization
 quality is the single most important factor: even a simple BFS cycling strategy
 on top of a \texttt{neato} layout beats from-scratch placement by a wide margin.
 
 \paragraph{Limitations.}
-Two limitations stand out from the experimental results.
+Three limitations stand out from the experimental results.
 
 First, all refinement methods depend entirely on the \texttt{neato}
 force-directed initialization.  The RL agent is a \emph{post-hoc corrector}
@@ -526,9 +529,18 @@ from the baseline.  A two-stage pipeline---first generating a coarse layout,
 then refining it---or a curriculum that trains the agent on layouts of
 increasing quality, could reduce this dependency.
 
-Second, the attempt to replace fixed BFS cycling with a learned node-selection
+Second, training budgets are not uniform across methods: simpler methods
+receive $5\times10^5$ timesteps while Sequential PPO and Sequential
+Refinement receive $3\times10^6$ and $2\times10^6$ respectively.  This
+disparity makes direct cross-method comparisons difficult to interpret---a
+weaker method given more compute might close the gap, and a stronger method
+given less might not fully converge.  Controlled experiments with a fixed
+budget would be needed to isolate architectural differences from training
+effort.
+
+Third, the attempt to replace fixed BFS cycling with a learned node-selection
 policy (Method~5, Node-Select Refinement) largely failed: it achieves only
-SPC $-5.20\%$ versus $-24.58\%$ for plain BFS cycling.  The root cause is
+SPC $-5.20\%$ versus $-24.43\%$ for plain BFS cycling.  The root cause is
 a weak gradient signal for the discrete node-selection head: the selection
 decision influences the reward only indirectly, through the quality of the
 subsequent displacement.  Possible remedies include differentiable selection
@@ -545,8 +557,8 @@ optimization, progressively addressing the limitations of each design.
 The central finding is that initialization quality dominates policy
 complexity: Sequential Refinement---a GAT policy that simply cycles through
 nodes in BFS order starting from a \texttt{neato} layout---achieves SPC
-$-24.58\%$ relative to \texttt{neato} on the Rome benchmark, far exceeding
-the from-scratch approach (Sequential PPO) and simpler neato-initialized methods.  The attempt to improve further with a learned
+$-24.43\%$ relative to \texttt{neato} on the Rome benchmark, far exceeding
+the BFS placement approach (Method~3) and simpler neato-initialized methods.  The attempt to improve further with a learned
 node-selection policy (Node-Select Refinement, SPC $-5.20\%$) highlights
 the difficulty of training discrete selection decisions with sparse
 RL rewards.  Future work should explore differentiable node selection and

@@ -40,7 +40,7 @@ def analyze_dataset(data_dir="rome"):
 
 
 def analyze_node_distribution(train_files, test_files, bin_size=10):
-    """统计 train/test 集中各图的节点数分布，按区间分组输出。"""
+    """Compute node count distribution in train/test sets, grouped by interval."""
 
     def count_bins(fpaths):
         bins = defaultdict(int)

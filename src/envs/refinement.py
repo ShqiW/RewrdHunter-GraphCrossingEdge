@@ -7,6 +7,7 @@ Action: continuous 2D delta offset (dx, dy) ∈ [-1, 1]²
 Reward: -ΔCrossings − λ·ΔStress
 Termination: zero crossings or max_steps reached.
 """
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -60,6 +61,7 @@ class RefinementGraphEnv(BaseGraphEnv):
         self.device = device
         self.structure_weight = config.structure_weight
         self.delta_scale = config.delta_scale
+        self.order_method = config.order_method
 
         self.neato_coords = graph_data.neato_coords.numpy()
         self.num_nodes = graph_data.num_nodes
@@ -141,6 +143,70 @@ class RefinementGraphEnv(BaseGraphEnv):
         self.total_crossings: int = 0
 
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _compute_node_order(self) -> list:
+        """Compute node traversal order according to self.order_method."""
+        method = self.order_method
+        n = self.num_nodes
+        start = int(np.random.randint(n))
+
+        if method == "bfs":
+            return self._bfs_from(start)
+
+        if method == "dfs":
+            return self._dfs_from(start)
+
+        if method == "random":
+            perm = list(range(n))
+            np.random.shuffle(perm)
+            return perm
+
+        if method in ("degree_desc", "degree_asc"):
+            degrees = [len(self.adj[v]) for v in range(n)]
+            reverse = (method == "degree_desc")
+            return sorted(range(n), key=lambda v: degrees[v], reverse=reverse)
+
+        if method == "degree_sample":
+            degrees = np.array([len(self.adj[v]) for v in range(n)], dtype=np.float32)
+            d = degrees - degrees.max()
+            probs = np.exp(d)
+            probs /= probs.sum()
+            return list(np.random.choice(n, size=n, replace=False, p=probs))
+
+        raise ValueError(f"Unknown order_method: {method!r}")
+
+    def _bfs_from(self, start: int) -> list:
+        order, visited = [], set()
+        queue = deque([start])
+        visited.add(start)
+        while queue:
+            node = queue.popleft()
+            order.append(node)
+            for nb in self.adj[node]:
+                if nb not in visited:
+                    visited.add(nb)
+                    queue.append(nb)
+        for n in range(self.num_nodes):
+            if n not in visited:
+                order.append(n)
+        return order
+
+    def _dfs_from(self, start: int) -> list:
+        order, visited = [], set()
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            order.append(node)
+            for nb in reversed(self.adj[node]):
+                if nb not in visited:
+                    stack.append(nb)
+        for n in range(self.num_nodes):
+            if n not in visited:
+                order.append(n)
+        return order
 
     def _get_initial_layout(self) -> np.ndarray:
         coords = get_initial_layout(
@@ -248,8 +314,7 @@ class RefinementGraphEnv(BaseGraphEnv):
                                     initial_coords)
         self.coords = self.gls.positions  # float64 alias
 
-        self.node_order = list(range(self.num_nodes))
-        np.random.shuffle(self.node_order)
+        self.node_order = self._compute_node_order()
 
         if self.config.exclude_non_crossing:
             crossing_nodes = self._get_nodes_in_crossings()
@@ -353,7 +418,7 @@ class RefinementGraphEnv(BaseGraphEnv):
             self.gls.batch_update(range(self.num_nodes), self.best_coords)
             self.total_crossings = self.best_crossings
             self.no_improve_steps = 0
-            np.random.shuffle(self.node_order)
+            self.node_order = self._compute_node_order()
             if self.soft_crossing:
                 self.current_soft_crossings = self._compute_soft_crossings(self.coords)
             self.current_stress = self._compute_structure_stress()

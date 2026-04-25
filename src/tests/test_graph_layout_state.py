@@ -3,10 +3,10 @@ Tests for GraphLayoutState — cache correctness and crossing detection.
 
 Test strategy
 -------------
-每个测试用例都有一个几何上明确的图（知道有几条交叉边），
-并通过以下两种方式验证 cache 的正确性：
-  1. 直接调用 compute_crossings() 的结果与预期值对比
-  2. 增量更新后的结果与"全量重建"后的结果对比（一致性检验）
+Each test case uses a geometrically explicit graph (with a known number of crossing edges),
+and verifies cache correctness via two methods:
+  1. Compare the result of compute_crossings() against the expected value.
+  2. Compare the result after incremental updates against the result after a full rebuild (consistency check).
 """
 import copy
 import time
@@ -24,9 +24,9 @@ from src.envs._crossing_all import precompute_geometry, find_all_crossings
 
 def make_x_graph():
     """
-    X 形图: 两条对角线交叉
-    节点: 0=(0,0), 1=(1,1), 2=(0,1), 3=(1,0)
-    边  : 0-1, 2-3  → 在 (0.5,0.5) 处恰好相交，crossing_count = 1
+    X-shaped graph: two crossing diagonals
+    Nodes: 0=(0,0), 1=(1,1), 2=(0,1), 3=(1,0)
+    Edges: 0-1, 2-3  -> intersect exactly at (0.5,0.5), crossing_count = 1
     """
     G = nx.Graph()
     G.add_edges_from([(0, 1), (2, 3)])
@@ -36,9 +36,9 @@ def make_x_graph():
 
 def make_square_graph():
     """
-    正方形图: 四条边，无交叉
-    节点: 0=(0,0), 1=(1,0), 2=(1,1), 3=(0,1)
-    边  : 0-1, 1-2, 2-3, 3-0
+    Square graph: four edges, no crossings
+    Nodes: 0=(0,0), 1=(1,0), 2=(1,1), 3=(0,1)
+    Edges: 0-1, 1-2, 2-3, 3-0
     """
     G = nx.Graph()
     G.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 0)])
@@ -48,24 +48,24 @@ def make_square_graph():
 
 def make_k4_graph():
     """
-    K4 完全图（4节点）用平面嵌入 → 0 交叉
-    节点: 0=(0,0), 1=(2,0), 2=(1,2), 3=(1,0.5) (中心点)
-    平面图，K4 可嵌入平面，这里用已知无交叉坐标。
+    K4 complete graph (4 nodes) with a planar embedding -> 0 crossings
+    Nodes: 0=(0,0), 1=(2,0), 2=(1,2), 3=(1,0.5) (center point)
+    Planar graph, K4 can be embedded in the plane; known crossing-free coordinates used here.
     """
     G = nx.complete_graph(4)
-    # 在正方形内嵌入，不产生交叉的已知坐标
+    # Embedded inside a square with known coordinates that produce crossings
     coords = np.array([
         [0.0, 0.0],  # 0
         [2.0, 0.0],  # 1
         [2.0, 2.0],  # 2
         [0.0, 2.0],  # 3
     ])
-    # K4 在这个布局里会有交叉 (对角线 0-2 和 1-3 相交)，这正是我们要测的
+    # K4 in this layout has crossings (diagonals 0-2 and 1-3 intersect), which is what we are testing
     return G, list(G.nodes()), coords
 
 
 def reference_crossing_count(state: GraphLayoutState) -> int:
-    """用 precompute_geometry 从零计算交叉数（不走 cache）。"""
+    """Compute crossing count from scratch using precompute_geometry (bypasses cache)."""
     active_idx = state._active_edge_indices()
     if len(active_idx) < 2:
         return 0
@@ -80,23 +80,23 @@ def reference_crossing_count(state: GraphLayoutState) -> int:
 
 def assert_cache_consistent(state: GraphLayoutState):
     """
-    验证增量 cache 与从零计算的结果完全一致。
-    同时检验 _node_dist、_half_lens、_midpoints、_mid_dist 的内部一致性。
+    Verify that the incremental cache matches the result computed from scratch.
+    Also checks internal consistency of _node_dist, _half_lens, _midpoints, and _mid_dist.
     """
-    # 先 flush（触发增量更新）
+    # First flush (trigger incremental update)
     count_inc, mask_inc = state.compute_crossings()
     count_ref = reference_crossing_count(state)
     assert count_inc == count_ref, (
-        f"交叉数不一致: cache={count_inc}, reference={count_ref}"
+        f"Crossing count mismatch: cache={count_inc}, reference={count_ref}"
     )
 
-    # 验证 _node_dist 对可见节点的对称性
+    # Verify symmetry of _node_dist for visible nodes
     vis = np.where(state.visible)[0]
     d = state._node_dist[np.ix_(vis, vis)]
-    assert np.allclose(d, d.T, atol=1e-10), "_node_dist 不对称"
-    assert np.allclose(np.diag(d), 0.0, atol=1e-10), "_node_dist 对角线非零"
+    assert np.allclose(d, d.T, atol=1e-10), "_node_dist is not symmetric"
+    assert np.allclose(np.diag(d), 0.0, atol=1e-10), "_node_dist diagonal is nonzero"
 
-    # 验证 _half_lens 与实际坐标一致
+    # Verify _half_lens matches actual coordinates
     active_idx = state._active_edge_indices()
     for e_idx in active_idx:
         u, v = state.edges[e_idx]
@@ -107,11 +107,11 @@ def assert_cache_consistent(state: GraphLayoutState):
         )
         expected_mid = (state.positions[u] + state.positions[v]) / 2
         assert np.allclose(state._midpoints[e_idx], expected_mid, atol=1e-9), (
-            f"edge {e_idx}: midpoint cache错误"
+            f"edge {e_idx}: midpoint cache error"
         )
 
 
-# ── 初始化测试 ─────────────────────────────────────────────────────────────────
+# ── Initialization tests ──────────────────────────────────────────────────────
 
 class TestInit:
     def test_basic_init(self):
@@ -128,7 +128,7 @@ class TestInit:
             np.testing.assert_array_equal(state.get_position(node), coord)
 
     def test_partial_visible(self):
-        """只有部分节点可见时，初始化应正常工作。"""
+        """Initialization should work correctly when only a subset of nodes are visible."""
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes[:2], coords[:2])
         assert state.num_visible == 2
@@ -153,7 +153,7 @@ class TestInit:
         assert len(state._dirty_nodes) == 0
 
 
-# ── 交叉检测正确性 ─────────────────────────────────────────────────────────────
+# ── Crossing detection correctness ────────────────────────────────────────────
 
 class TestCrossings:
     def test_x_shape_has_one_crossing(self):
@@ -170,24 +170,24 @@ class TestCrossings:
         assert count == 0
 
     def test_k4_corner_layout_crossings(self):
-        """K4 的正方形四角布局有 1 条交叉（对角线 0-2 与 1-3）。"""
+        """K4 in a square corner layout has 1 crossing (diagonals 0-2 and 1-3)."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
         count, _ = state.compute_crossings()
         assert_cache_consistent(state)
-        # 正方形 K4: 只有对角线 {0,2} 和 {1,3} 相交
+        # Square K4: only diagonals {0,2} and {1,3} intersect
         assert count == 1
 
     def test_crossing_mask_upper_triangular(self):
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes, coords)
         _, mask = state.compute_crossings()
-        # 下三角必须全为 False
+        # Lower triangle must be all False
         lower = np.tril(mask, k=-1)
         assert not lower.any()
 
     def test_adjacent_edges_not_counted(self):
-        """共享端点的边不应被计为交叉。"""
+        """Edges sharing an endpoint should not be counted as crossing."""
         G = nx.Graph()
         G.add_edges_from([(0, 1), (1, 2)])
         coords = np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 0.0]])
@@ -196,7 +196,7 @@ class TestCrossings:
         assert count == 0
 
     def test_parallel_non_overlapping_no_crossing(self):
-        """平行但不重叠的两条边不应被判为交叉。"""
+        """Parallel but non-overlapping edges should not be judged as crossing."""
         G = nx.Graph()
         G.add_edges_from([(0, 1), (2, 3)])
         coords = np.array([[0.0, 0.0], [1.0, 0.0],
@@ -207,19 +207,19 @@ class TestCrossings:
 
     def test_two_diagonal_crossings(self):
         """
-        两条对角线（X 形的变体，用 make_x_graph 节点但不同边），确认有 1 条交叉。
-        节点: 0=(0,0), 1=(1,1), 2=(0,1), 3=(1,0)
-        边  : 0-3 (从左下到右下, 水平) 与 2-1 (从左上到右上，水平) → 平行不交叉
-        → 改为明确测试 make_x_graph 已覆盖，这里改为对角线明确构造。
+        Two diagonals (a variant of X-shape using make_x_graph nodes but different edges), confirmed to have 1 crossing.
+        Nodes: 0=(0,0), 1=(1,1), 2=(0,1), 3=(1,0)
+        Edges: 0-3 (bottom-left to bottom-right, horizontal) and 2-1 (top-left to top-right, horizontal) -> parallel, no crossing
+        -> Changed to an explicit diagonal construction since make_x_graph already covers the original case.
 
-        明确用 node_list 顺序传入坐标，避免 networkx 节点插入顺序的歧义。
+        Uses explicit node_list order for coordinates to avoid ambiguity in networkx node insertion order.
         """
         G = nx.Graph()
-        G.add_nodes_from([0, 1, 2, 3])   # 先注册节点，保证顺序
-        G.add_edges_from([(0, 2), (1, 3)])  # 对角线
+        G.add_nodes_from([0, 1, 2, 3])   # register nodes first to guarantee order
+        G.add_edges_from([(0, 2), (1, 3)])  # diagonals
         nodes = [0, 1, 2, 3]
-        # 节点位置: 0=(0,0), 1=(1,0), 2=(1,1), 3=(0,1)
-        # 边 (0,2): (0,0)→(1,1)；边 (1,3): (1,0)→(0,1)  → 两对角线相交
+        # Node positions: 0=(0,0), 1=(1,0), 2=(1,1), 3=(0,1)
+        # Edge (0,2): (0,0)->(1,1); Edge (1,3): (1,0)->(0,1)  -> two diagonals intersect
         coords = np.array([[0.0, 0.0], [1.0, 0.0],
                            [1.0, 1.0], [0.0, 1.0]])
         state = GraphLayoutState(G, nodes, coords)
@@ -228,35 +228,35 @@ class TestCrossings:
         assert_cache_consistent(state)
 
 
-# ── 增量更新一致性（核心） ─────────────────────────────────────────────────────
+# ── Incremental update consistency (core) ─────────────────────────────────────
 
 class TestIncrementalUpdateConsistency:
     """
-    核心测试：每次写操作后，cache 与从零计算的结果完全一致。
+    Core tests: after every write operation, the cache must fully match the result computed from scratch.
     """
 
     def test_update_position_creates_crossing(self):
-        """初始无交叉 → 移动节点使边相交 → 检测到 1 条交叉。"""
+        """Initially no crossing -> move a node so edges intersect -> detect 1 crossing."""
         G, nodes, coords = make_square_graph()
         state = GraphLayoutState(G, nodes, coords)
         assert state.compute_crossings()[0] == 0
 
-        # 把节点 2 (1,1) 移到 (0.1, 0.1)，使边 1-2 和 3-0 交叉
+        # Move node 2 (1,1) to (0.1, 0.1), causing edges 1-2 and 3-0 to cross
         state.update_position(2, [0.1, 0.1])
         assert_cache_consistent(state)
 
     def test_update_position_removes_crossing(self):
-        """X 形 → 移动节点消除交叉。"""
+        """X-shape -> move a node to eliminate the crossing."""
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes, coords)
         assert state.compute_crossings()[0] == 1
 
-        # 把节点 1 (1,1) 移到 (2,2)，使两条边不再相交
+        # Move node 1 (1,1) to (2,2) so the two edges no longer intersect
         state.update_position(1, [2.0, 2.0])
         assert_cache_consistent(state)
 
     def test_batch_update_consistency(self):
-        """batch_update 更新多个节点后 cache 与 reference 一致。"""
+        """Cache and reference must match after batch_update modifies multiple nodes."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
 
@@ -267,17 +267,17 @@ class TestIncrementalUpdateConsistency:
         assert_cache_consistent(state)
 
     def test_apply_deltas_consistency(self):
-        """apply_deltas 后 cache 与 reference 一致。"""
+        """Cache and reference must match after apply_deltas."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
 
-        # 对所有节点施加一个小位移
+        # Apply a small displacement to all nodes
         deltas = np.random.default_rng(42).uniform(-0.1, 0.1, (4, 2))
         state.apply_deltas(nodes, deltas)
         assert_cache_consistent(state)
 
     def test_multiple_updates_accumulate_correctly(self):
-        """连续多次增量更新后结果仍正确。"""
+        """Results remain correct after multiple consecutive incremental updates."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
         rng = np.random.default_rng(0)
@@ -290,17 +290,17 @@ class TestIncrementalUpdateConsistency:
         assert_cache_consistent(state)
 
     def test_apply_deltas_then_batch_update(self):
-        """apply_deltas 之后再 batch_update，覆盖 delta_valid 标志。"""
+        """After apply_deltas, a batch_update should overwrite the delta_valid flag."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
 
         state.apply_deltas(nodes[:2], np.array([[0.1, 0.0], [-0.1, 0.0]]))
-        # batch_update 应清空 delta_valid（绝对写）
+        # batch_update should clear delta_valid (absolute write)
         state.batch_update(nodes[2:], np.array([[2.5, 2.5], [0.5, 2.5]]))
         assert_cache_consistent(state)
 
     def test_no_dirty_after_flush(self):
-        """compute_crossings 之后 dirty set 清空，已 flush 节点的 delta 也应重置。"""
+        """After compute_crossings, the dirty set should be cleared and deltas for flushed nodes should be reset."""
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes, coords)
         state.update_position(nodes[0], [0.1, 0.1])
@@ -314,7 +314,7 @@ class TestIncrementalUpdateConsistency:
         np.testing.assert_array_equal(state._node_deltas[idx], [0.0, 0.0])
 
     def test_idempotent_second_call(self):
-        """连续两次 compute_crossings 结果相同。"""
+        """Two consecutive calls to compute_crossings should return the same result."""
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords)
         c1, m1 = state.compute_crossings()
@@ -323,7 +323,7 @@ class TestIncrementalUpdateConsistency:
         np.testing.assert_array_equal(m1, m2)
 
 
-# ── 节点揭示 (unmask_node) ────────────────────────────────────────────────────
+# ── Node unmasking (unmask_node) ──────────────────────────────────────────────
 
 class TestUnmaskNode:
     def test_unmask_reveals_node(self):
@@ -336,9 +336,9 @@ class TestUnmaskNode:
         np.testing.assert_array_equal(state.get_position(nodes[2]), coords[2])
 
     def test_unmask_updates_crossing_detection(self):
-        """揭示所有节点后，交叉检测结果应与全量初始化一致。"""
+        """After revealing all nodes, crossing detection should match full initialization."""
         G, nodes, coords = make_x_graph()
-        # 先只放 2 个节点（不构成活跃边的两端点都可见）
+        # Start with only 2 nodes (active edges require both endpoints visible)
         state = GraphLayoutState(G, nodes[:1], coords[:1])
         for node, coord in zip(nodes[1:], coords[1:]):
             state.unmask_node(node, coord)
@@ -354,7 +354,7 @@ class TestUnmaskNode:
             state.unmask_node(nodes[0], coords[0])
 
     def test_unmask_then_update_consistent(self):
-        """先揭示节点，再移动，cache 仍一致。"""
+        """After revealing a node and then moving it, the cache should still be consistent."""
         G, nodes, coords = make_square_graph()
         state = GraphLayoutState(G, nodes[:3], coords[:3])
         state.unmask_node(nodes[3], coords[3])
@@ -362,7 +362,7 @@ class TestUnmaskNode:
         assert_cache_consistent(state)
 
 
-# ── 错误处理 ──────────────────────────────────────────────────────────────────
+# ── Error handling ────────────────────────────────────────────────────────────
 
 class TestErrorHandling:
     def test_update_invisible_node_raises(self):
@@ -384,11 +384,11 @@ class TestErrorHandling:
             state.apply_deltas(nodes, np.zeros((4, 2)))
 
 
-# ── node_dist cache 正确性 ────────────────────────────────────────────────────
+# ── node_dist cache correctness ───────────────────────────────────────────────
 
 class TestNodeDistCache:
     def test_node_dist_initialized_correctly(self):
-        """初始化后 _node_dist 应等于手工计算的距离矩阵。"""
+        """After initialization, _node_dist should equal the manually computed distance matrix."""
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes, coords)
         vis_idx = np.where(state.visible)[0]
@@ -398,7 +398,7 @@ class TestNodeDistCache:
                 assert abs(state._node_dist[i, j] - expected) < 1e-10
 
     def test_node_dist_updated_after_move(self):
-        """移动节点后 flush，_node_dist 应反映新坐标。"""
+        """After moving a node and flushing, _node_dist should reflect the new coordinates."""
         G, nodes, coords = make_x_graph()
         state = GraphLayoutState(G, nodes, coords)
         new_pos = np.array([0.5, 0.5])
@@ -411,12 +411,12 @@ class TestNodeDistCache:
             assert abs(state._node_dist[state.n2i[nodes[0]], j] - expected) < 1e-9
 
 
-# ── 大图压力测试 ──────────────────────────────────────────────────────────────
+# ── Large-graph stress tests ──────────────────────────────────────────────────
 
 class TestStress:
     def test_random_graph_cache_consistency(self):
         """
-        对随机 Erdős–Rényi 图做若干次随机更新，每次都验证 cache 一致性。
+        Perform several random updates on a random Erdos-Renyi graph and verify cache consistency after each.
         """
         rng = np.random.default_rng(123)
         G = nx.erdos_renyi_graph(20, 0.25, seed=123)
@@ -425,7 +425,7 @@ class TestStress:
         state = GraphLayoutState(G, nodes, coords)
 
         for _ in range(20):
-            # 随机选 1~3 个节点做 batch_update
+            # Randomly select 1~3 nodes for batch_update
             k = rng.integers(1, 4)
             chosen = rng.choice(nodes, k, replace=False).tolist()
             new_coords = rng.uniform(0, 1, (k, 2))
@@ -434,8 +434,8 @@ class TestStress:
 
     def test_incremental_matches_full_rebuild_after_many_moves(self):
         """
-        对同一个图，一份用增量更新，一份每次全量重建，
-        经过多轮移动后两者的 compute_crossings() 结果完全一致。
+        For the same graph, compare incremental updates against full rebuilds after each move;
+        the compute_crossings() results must be identical throughout.
         """
         rng = np.random.default_rng(7)
         G = nx.erdos_renyi_graph(12, 0.3, seed=7)
@@ -452,41 +452,41 @@ class TestStress:
         for node, new_coord in moves:
             state_inc.update_position(node, new_coord)
 
-            # 重建参照：使用当前 state_inc 的坐标从头算
+            # Reference rebuild: compute from scratch using current state_inc coordinates
             ref_state = GraphLayoutState(G, nodes, state_inc.positions.copy())
             inc_count, _ = state_inc.compute_crossings()
             ref_count, _ = ref_state.compute_crossings()
             assert inc_count == ref_count, (
-                f"移动 {node} 到 {new_coord} 后: inc={inc_count}, ref={ref_count}"
+                f"After moving {node} to {new_coord}: inc={inc_count}, ref={ref_count}"
             )
 
 
-# ── 退化几何：塌缩到线 / 点 ────────────────────────────────────────────────────
+# ── Degenerate geometry: collapse to a line / point ───────────────────────────
 
 class TestDegenerateCollapse:
     """
-    验证当节点被显式移动到退化位置（共线重叠、全部重叠于一点）时，
-    交叉检测不会被愚弄：
-      - 重叠的线段 → 共线重叠交叉必须被检出（Phase 2 collinear_overlap）
-      - 所有节点重叠于一点 → ALL C(E,2) 条边对均计为交叉（Phase 0）
-      - 退化后的交叉数必须远大于原图
+    Verify that crossing detection is not fooled when nodes are explicitly moved
+    to degenerate positions (collinear overlap, all collapsed to one point):
+      - Overlapping segments -> collinear-overlap crossings must be detected (Phase 2 collinear_overlap)
+      - All nodes at one point -> ALL C(E,2) edge pairs count as crossing (Phase 0)
+      - Crossing count after degeneration must be much larger than the original
 
-    关于"应接近所有点的 degree 的叠乘"
-    ------------------------------------
-    当所有 N 个节点重叠于同一点时，对每个相互重叠的节点对 (u, v)，
-    Phase 0 把 deg(u)×deg(v) 条边对加入 crossing_mask（mask 去重）。
-    最终精确结果为 C(E, 2) = E*(E-1)/2，即所有 E 条活跃边两两相交。
-    这是一个比"degree 叠乘"更紧的精确值，且随 E 快速增长。
+    On "should approach the product of all node degrees"
+    ---------------------------------------------------
+    When all N nodes overlap at the same point, for each overlapping node pair (u, v),
+    Phase 0 adds deg(u)*deg(v) edge pairs to crossing_mask (after deduplication).
+    The exact result is C(E, 2) = E*(E-1)/2, i.e., all E active edges cross each other pairwise.
+    This is a tighter exact value than the "degree product" bound and grows rapidly with E.
     """
 
-    # ── 辅助：构建确定性 star / path / cross 图 ──────────────────────────────
+    # ── Helper: build deterministic star / path / cross graph ────────────────
 
     @staticmethod
     def _make_cross_graph():
         """
-        十字图：5 个节点，中心 + 四臂；4 条边，全部相邻。
-        节点 0=中心, 1/2/3/4=臂端。
-        初始布局: 中心(0.5,0.5), 四角各一臂。
+        Cross graph: 5 nodes, center + four arms; 4 edges, all adjacent.
+        Node 0=center, 1/2/3/4=arm endpoints.
+        Initial layout: center at (0.5,0.5), one arm at each corner.
         """
         G = nx.Graph()
         G.add_nodes_from([0, 1, 2, 3, 4])
@@ -503,9 +503,9 @@ class TestDegenerateCollapse:
     @staticmethod
     def _make_chord_graph():
         """
-        弦图：6 个节点均匀排布在正六边形上，
-        加上 3 条穿越直径的长弦 (0-3, 1-4, 2-5)。
-        三条弦两两相交（在中心附近），初始交叉数 = 3。
+        Chord graph: 6 nodes evenly distributed on a regular hexagon,
+        with 3 long diameter-crossing chords (0-3, 1-4, 2-5).
+        The three chords cross each other pairwise (near the center); initial crossing count = 3.
         """
         G = nx.Graph()
         G.add_nodes_from(range(6))
@@ -514,38 +514,39 @@ class TestDegenerateCollapse:
         coords = np.column_stack([np.cos(angles), np.sin(angles)])
         return G, list(range(6)), coords
 
-    # ── 1. 共线重叠（线段在同一直线上且区间重叠）────────────────────────────
+    # ── 1. Collinear overlap (segments on same line with overlapping intervals) ──
 
     def test_collinear_overlap_two_edges(self):
         """
-        两条不相邻边都移到 x 轴上，且区间重叠 → collinear_overlap 路径检出 1 条交叉。
+        Two non-adjacent edges both moved onto the x-axis with overlapping intervals
+        -> collinear_overlap path detects 1 crossing.
 
-        布局: 节点 0=(0,0), 1=(1,0), 2=(3,0), 3=(4,0)
-        边 (0,2): x∈[0,3]; 边 (1,3): x∈[1,4]; 重叠区间 [1,3] 非空 → 交叉。
+        Layout: nodes 0=(0,0), 1=(1,0), 2=(3,0), 3=(4,0)
+        Edge (0,2): x in [0,3]; Edge (1,3): x in [1,4]; overlap interval [1,3] is non-empty -> crossing.
         """
         G = nx.Graph()
         G.add_nodes_from([0, 1, 2, 3])
         G.add_edges_from([(0, 2), (1, 3)])
         nodes = [0, 1, 2, 3]
-        # 初始: 竖向分开，无交叉
+        # Initial: vertically separated, no crossings
         state = GraphLayoutState(G, nodes,
                                   np.array([[0.0, 0.0], [1.0, 0.0],
                                             [0.0, 1.0], [1.0, 1.0]]))
         assert state.compute_crossings()[0] == 0
 
-        # 塌缩到 x 轴，区间重叠
+        # Collapse to x-axis with overlapping intervals
         state.batch_update(nodes,
                            np.array([[0.0, 0.0], [1.0, 0.0],
                                      [3.0, 0.0], [4.0, 0.0]]))
         count, _ = state.compute_crossings()
-        assert count == 1, f"共线重叠应检出 1 条交叉，实际 {count}"
+        assert count == 1, f"Collinear overlap should detect 1 crossing, got {count}"
         assert_cache_consistent(state)
 
     def test_collinear_nested_edge_detected(self):
         """
-        一条长边完全包含另一条短边（嵌套）→ 仍属于 collinear_overlap，应检出。
+        One long edge completely contains another short edge (nested) -> still collinear_overlap, should be detected.
 
-        边 (0,3): x∈[0,3]; 边 (1,2): x∈[1,2]，完全在前者内部。
+        Edge (0,3): x in [0,3]; Edge (1,2): x in [1,2], completely inside the former.
         """
         G = nx.Graph()
         G.add_nodes_from([0, 1, 2, 3])
@@ -555,14 +556,14 @@ class TestDegenerateCollapse:
                            [2.0, 0.0], [3.0, 0.0]])
         state = GraphLayoutState(G, nodes, coords)
         count, _ = state.compute_crossings()
-        assert count == 1, f"嵌套共线边应检出 1 条交叉，实际 {count}"
+        assert count == 1, f"Nested collinear edges should detect 1 crossing, got {count}"
         assert_cache_consistent(state)
 
     def test_collinear_endpoint_touch_not_counted(self):
         """
-        共线且只在端点相接的相邻边（路径图）→ 不算交叉。
+        Collinear adjacent edges that only touch at endpoints (path graph) -> not counted as crossing.
 
-        路径 0-1-2-3 全部移到 x 轴，三条边首尾相接，无区间重叠。
+        Path 0-1-2-3 all moved to the x-axis; three edges meet end-to-end with no interval overlap.
         """
         G = nx.path_graph(4)   # edges: (0,1),(1,2),(2,3)
         nodes = list(G.nodes())
@@ -570,47 +571,47 @@ class TestDegenerateCollapse:
                            [2.0, 0.0], [3.0, 0.0]])
         state = GraphLayoutState(G, nodes, coords)
         count, _ = state.compute_crossings()
-        assert count == 0, f"端点相接的相邻边不应计为交叉，实际 {count}"
+        assert count == 0, f"Adjacent edges touching only at endpoints should not be counted as crossing, got {count}"
 
     def test_cross_graph_collapse_arms_to_one_line(self):
         """
-        十字图：4 臂节点全部移到中心节点所在直线上。
-        所有边都从中心出发，相邻（共享中心），故不应产生额外交叉，
-        但当两臂节点与中心节点三点重叠时，Phase 0 会检出交叉。
+        Cross graph: all 4 arm nodes moved to the line through the center node.
+        All edges start from the center and are adjacent (share the center), so no extra crossings should be created,
+        but when two arm nodes overlap with the center node, Phase 0 detects crossings.
         """
         G, nodes, coords = self._make_cross_graph()
         state = GraphLayoutState(G, nodes, coords)
 
-        # 把全部 4 个臂端移到与中心 (0.5, 0.5) 重叠的位置
+        # Move all 4 arm endpoints to overlap with the center (0.5, 0.5)
         state.batch_update(
             [1, 2, 3, 4],
             np.full((4, 2), [0.5, 0.5]),
         )
         count, _ = state.compute_crossings()
-        # 5 个节点全部重叠 → E=4 条边 → C(4,2)=6 条交叉
-        assert count == 6, f"全部重叠时 C(4,2)=6，实际 {count}"
+        # All 5 nodes overlap -> E=4 edges -> C(4,2)=6 crossings
+        assert count == 6, f"When all overlap, C(4,2)=6, got {count}"
         assert_cache_consistent(state)
 
-    # ── 2. 所有节点重叠于一点 ────────────────────────────────────────────────
+    # ── 2. All nodes collapsed to one point ───────────────────────────────────
 
     def test_all_nodes_to_single_point_exact_count(self):
         """
-        将图所有节点移到同一坐标点：
-          - 所有 E 条活跃边两两形成 Phase-0 重叠交叉
-          - 精确值 = C(E,2) = E*(E-1)//2
-          - 必须严格大于原始交叉数
+        Move all nodes to the same coordinate:
+          - All E active edges form Phase-0 overlap crossings pairwise
+          - Exact count = C(E,2) = E*(E-1)//2
+          - Must be strictly greater than the original crossing count
 
-        使用正方形图（4节点，4条边，初始无交叉）：
-          orig=0, collapsed=C(4,2)=6。
+        Using the square graph (4 nodes, 4 edges, initially no crossings):
+          orig=0, collapsed=C(4,2)=6.
         """
         G, nodes, coords = make_square_graph()
 
-        # 原始无交叉
+        # Originally no crossings
         state_orig = GraphLayoutState(G, nodes, coords.copy())
         orig_count, _ = state_orig.compute_crossings()
         assert orig_count == 0
 
-        # 全部移到同一点
+        # Move all to one point
         state = GraphLayoutState(G, nodes, coords.copy())
         state.batch_update(nodes, np.full((len(nodes), 2), 0.5))
 
@@ -619,17 +620,17 @@ class TestDegenerateCollapse:
         expected = E * (E - 1) // 2  # C(4,2) = 6
 
         assert count == expected, (
-            f"所有节点重叠时应有 C(E,2)=C({E},2)={expected} 条交叉，实际 {count}"
+            f"When all nodes overlap, expected C(E,2)=C({E},2)={expected} crossings, got {count}"
         )
         assert count > orig_count, (
-            f"重叠后 {count} 必须严格大于原始交叉数 {orig_count}"
+            f"After overlap, {count} must be strictly greater than original crossing count {orig_count}"
         )
         assert_cache_consistent(state)
 
     def test_all_nodes_to_single_point_k4(self):
         """
-        K4（4 节点 6 边）全部移到一点：expected = C(6,2) = 15。
-        同时验证 15 >> 原始交叉数 1（正方形布局只有 1 条对角线交叉）。
+        K4 (4 nodes, 6 edges) all moved to one point: expected = C(6,2) = 15.
+        Also verifies 15 >> original crossing count 1 (square layout has only 1 diagonal crossing).
         """
         G, nodes, coords = make_k4_graph()
         state = GraphLayoutState(G, nodes, coords.copy())
@@ -641,52 +642,52 @@ class TestDegenerateCollapse:
         E = state.E
         expected = E * (E - 1) // 2
         assert count == expected, (
-            f"K4 全部重叠应有 C(6,2)=15 条交叉，实际 {count}"
+            f"K4 all overlapping should have C(6,2)=15 crossings, got {count}"
         )
         assert count > orig_count * 10, (
-            f"重叠后交叉数 {count} 应远大于原始 {orig_count}（10× 以上）"
+            f"After overlap, crossing count {count} should be much larger than original {orig_count} (10x or more)"
         )
         assert_cache_consistent(state)
 
     def test_single_point_collapse_then_restore(self):
         """
-        将节点全部移到一点，再移回原坐标：交叉数应恢复到原始值。
-        验证退化状态不会"污染"后续 cache。
-        使用正方形图（初始 0 交叉，塌缩后 C(4,2)=6）。
+        Move all nodes to one point, then restore to original coordinates: crossing count should recover to original.
+        Verify that degenerate state does not contaminate subsequent cache.
+        Using square graph (initially 0 crossings, collapsed to C(4,2)=6).
         """
         G, nodes, coords = make_square_graph()
         state = GraphLayoutState(G, nodes, coords.copy())
         orig_count, _ = state.compute_crossings()
         assert orig_count == 0
 
-        # 全部移到一点
+        # Move all to one point
         state.batch_update(nodes, np.full((len(nodes), 2), 0.5))
         collapsed_count, _ = state.compute_crossings()
         assert collapsed_count > orig_count
 
-        # 恢复原坐标
+        # Restore original coordinates
         state.batch_update(nodes, coords)
         restored_count, _ = state.compute_crossings()
         assert restored_count == orig_count, (
-            f"恢复原坐标后交叉数应为 {orig_count}，实际 {restored_count}"
+            f"After restoring coordinates, crossing count should be {orig_count}, got {restored_count}"
         )
         assert_cache_consistent(state)
 
-    # ── 3. 部分节点重叠 ──────────────────────────────────────────────────────
+    # ── 3. Partial node overlap ───────────────────────────────────────────────
 
     def test_two_nodes_overlap_phase0_exact(self):
         """
-        两个非相邻节点重叠 → Phase 0 精确检出 deg(u)×deg(v) 条交叉。
+        Two non-adjacent nodes overlap -> Phase 0 exactly detects deg(u)*deg(v) crossings.
 
-        图: 0-1, 0-2, 3-4, 3-5（两组 Y 形，无公共节点）
-        把节点 0 和节点 3 移到同一位置：
-          deg(0)=2, deg(3)=2 → 2×2=4 条交叉对
+        Graph: 0-1, 0-2, 3-4, 3-5 (two Y-shapes, no common nodes)
+        Move node 0 and node 3 to the same position:
+          deg(0)=2, deg(3)=2 -> 2*2=4 crossing pairs
         """
         G = nx.Graph()
         G.add_nodes_from(range(6))
         G.add_edges_from([(0, 1), (0, 2), (3, 4), (3, 5)])
         nodes = list(range(6))
-        # 初始: 两个 Y 形完全分开，无交叉
+        # Initial: two Y-shapes completely separated, no crossings
         coords = np.array([
             [0.0, 0.5], [0.0, 0.0], [0.0, 1.0],   # Y on left
             [2.0, 0.5], [2.0, 0.0], [2.0, 1.0],   # Y on right
@@ -694,21 +695,21 @@ class TestDegenerateCollapse:
         state = GraphLayoutState(G, nodes, coords)
         assert state.compute_crossings()[0] == 0
 
-        # 节点 0 和节点 3 重叠
+        # Node 0 and node 3 overlap
         state.batch_update([0, 3], np.array([[1.0, 0.5], [1.0, 0.5]]))
         count, _ = state.compute_crossings()
 
-        # deg(0)=2, deg(3)=2 → 4 对，无额外几何交叉
+        # deg(0)=2, deg(3)=2 -> 4 pairs, no additional geometric crossings
         assert count == 4, (
-            f"两节点重叠 deg=2×2 应检出 4 条交叉，实际 {count}"
+            f"Two nodes overlap deg=2*2 should detect 4 crossings, got {count}"
         )
         assert_cache_consistent(state)
 
     def test_incremental_collapse_step_by_step(self):
         """
-        逐步把弦图节点移到一点，每步都验证：
-          - 交叉数单调不减（更多重叠只会增加或保持交叉数）
-          - cache 与 reference 始终一致
+        Incrementally move chord graph nodes to one point, verify at each step:
+          - Crossing count is non-decreasing (more overlap only increases or maintains count)
+          - Cache and reference always consistent
         """
         G, nodes, coords = self._make_chord_graph()
         state = GraphLayoutState(G, nodes, coords.copy())
@@ -719,33 +720,34 @@ class TestDegenerateCollapse:
             state.update_position(node, target)
             count, _ = state.compute_crossings()
             assert count >= prev_count, (
-                f"移动节点 {node} 到中心后交叉数从 {prev_count} 降至 {count}，"
-                f"违反单调性（重叠只应增加交叉）"
+                f"After moving node {node} to center, crossing count dropped from {prev_count} to {count}, "
+                f"violates monotonicity (overlap should only increase crossings)"
             )
             assert_cache_consistent(state)
             prev_count = count
 
-        # 最终应为 C(E,2)
+        # Final result should be C(E,2)
         E = state.E
         assert prev_count == E * (E - 1) // 2
 
 
-# ── 性能压力测试（FPS 回归） ─────────────────────────────────────────────────────
+# ── Performance stress test (FPS regression) ─────────────────────────────────
 #
-# 测量"RL 步 = update_position + compute_crossings"的吞吐量（FPS）。
-# 每个 scenario 会把实测 FPS 写入 tests/fps_baseline.json（如果文件不存在则新建）。
-# 当 baseline 已存在时，要求实测 FPS 不低于 baseline 的 50%，以检测剧烈性能退化。
+# Measures throughput (FPS) for "RL step = update_position + compute_crossings".
+# Each scenario writes the measured FPS to tests/fps_baseline.json (creates the file if it doesn't exist).
+# When a baseline exists, requires measured FPS to be at least 50% of the baseline,
+# to detect severe performance regressions.
 #
-# 阈值说明
-# --------
-#   REGRESSION_TOLERANCE = 0.50  → 允许最多 50% 的性能下降
-#   WARMUP_ITERS         = 20    → 预热轮次，不计入计时
-#   BENCH_ITERS          = 200   → 计时轮次（越多越稳定）
+# Threshold notes
+# ---------------
+#   REGRESSION_TOLERANCE = 0.50  -> allows at most 50% performance degradation
+#   WARMUP_ITERS         = 20    -> warmup iterations, not included in timing
+#   BENCH_ITERS          = 200   -> timed iterations (more = more stable)
 #
-# 如何更新 baseline：删除 tests/fps_baseline.json，重新运行测试即可。
+# To update baseline: delete tests/fps_baseline.json and rerun the tests.
 
 _FPS_BASELINE_FILE = os.path.join(os.path.dirname(__file__), "fps_baseline.json")
-_REGRESSION_TOLERANCE = 0.50   # 允许退化至 baseline 的 50%
+_REGRESSION_TOLERANCE = 0.50   # allow degradation to 50% of baseline
 _WARMUP_ITERS = 20
 _BENCH_ITERS  = 200
 
@@ -766,7 +768,7 @@ def _save_fps_baseline(data: dict) -> None:
 
 def _measure_fps(state: GraphLayoutState, nodes: list, rng, iters: int) -> float:
     """
-    执行 iters 次"随机移动单节点 + compute_crossings"，返回 FPS。
+    Execute iters iterations of "randomly move one node + compute_crossings", return FPS.
     """
     n = len(nodes)
     t0 = time.perf_counter()
@@ -780,10 +782,10 @@ def _measure_fps(state: GraphLayoutState, nodes: list, rng, iters: int) -> float
 
 
 def _make_bench_graph(n_nodes: int, edge_prob: float, seed: int):
-    """构建压力测试用随机图并初始化 GraphLayoutState。"""
+    """Build a random graph for stress testing and initialize GraphLayoutState."""
     rng = np.random.default_rng(seed)
     G = nx.erdos_renyi_graph(n_nodes, edge_prob, seed=seed)
-    # 确保至少有一个连通分量，不影响测试目的
+    # Ensure at least one connected component; does not affect test purpose
     nodes = list(G.nodes())
     coords = rng.uniform(0.0, 1.0, (len(nodes), 2))
     state = GraphLayoutState(G, nodes, coords)
@@ -792,17 +794,17 @@ def _make_bench_graph(n_nodes: int, edge_prob: float, seed: int):
 
 class TestPerformanceFPS:
     """
-    FPS 压力测试：
-      - scenario_small  : N=20,  E≈~40   （小图，模拟简单环境）
-      - scenario_medium : N=50,  E≈~150  （中图，典型 RL 训练场景）
-      - scenario_large  : N=100, E≈~400  （大图，压力上限）
+    FPS stress test:
+      - scenario_small  : N=20,  E~40   (small graph, simulates simple env)
+      - scenario_medium : N=50,  E~150  (medium graph, typical RL training scenario)
+      - scenario_large  : N=100, E~400  (large graph, stress upper bound)
 
-    每个 scenario 分别测量并校验 FPS 不剧烈退化（vs. 已存 baseline）。
+    Each scenario is measured and verified that FPS does not degrade severely (vs. stored baseline).
     """
 
     @pytest.fixture(autouse=True)
     def _baseline(self):
-        """在所有测试结束后统一持久化 baseline。"""
+        """Persist baseline after all tests complete."""
         self._fps_data = _load_fps_baseline()
         yield
         _save_fps_baseline(self._fps_data)
@@ -811,56 +813,56 @@ class TestPerformanceFPS:
         state, nodes = _make_bench_graph(n_nodes, edge_prob, seed)
         rng = np.random.default_rng(seed + 1)
 
-        # 预热
+        # Warmup
         _measure_fps(state, nodes, rng, _WARMUP_ITERS)
 
-        # 重置 rng 保证可复现
+        # Reset rng for reproducibility
         rng = np.random.default_rng(seed + 2)
         fps = _measure_fps(state, nodes, rng, _BENCH_ITERS)
 
         print(f"\n[FPS] {key}: N={n_nodes}, E={state.E}, FPS={fps:.1f}")
 
-        # 回归检验
+        # Regression check
         if key in self._fps_data:
             baseline_fps = self._fps_data[key]
             threshold = baseline_fps * _REGRESSION_TOLERANCE
             assert fps >= threshold, (
-                f"[FPS 退化] {key}: 当前 {fps:.1f} fps < "
-                f"baseline {baseline_fps:.1f} × {_REGRESSION_TOLERANCE} "
+                f"[FPS degradation] {key}: current {fps:.1f} fps < "
+                f"baseline {baseline_fps:.1f} x {_REGRESSION_TOLERANCE} "
                 f"= {threshold:.1f} fps"
             )
         else:
-            # 首次运行：记录 baseline
+            # First run: record baseline
             self._fps_data[key] = round(fps, 1)
-            print(f"[FPS] {key}: 已记录新 baseline = {fps:.1f} fps")
+            print(f"[FPS] {key}: new baseline recorded = {fps:.1f} fps")
 
     def test_fps_small_graph(self):
-        """N=20 小图，验证 FPS 基本性能不退化。"""
+        """N=20 small graph, verify FPS basic performance does not degrade."""
         self._run_scenario("small_N20_p020", n_nodes=20, edge_prob=0.20, seed=10)
 
     def test_fps_medium_graph(self):
-        """N=50 中图，典型 RL 训练场景。"""
+        """N=50 medium graph, typical RL training scenario."""
         self._run_scenario("medium_N50_p015", n_nodes=50, edge_prob=0.15, seed=20)
 
     def test_fps_large_graph(self):
-        """N=100 大图，压力上限。"""
+        """N=100 large graph, stress upper bound."""
         self._run_scenario("large_N100_p010", n_nodes=100, edge_prob=0.10, seed=30)
 
     def test_fps_dense_medium_graph(self):
-        """N=30 密集图（高边密度），交叉检测 cost 更高。"""
+        """N=30 dense graph (high edge density), crossing detection cost is higher."""
         self._run_scenario("dense_N30_p040", n_nodes=30, edge_prob=0.40, seed=40)
 
     def test_fps_batch_update_medium_graph(self):
         """
-        batch_update（一次更新多节点） + compute_crossings 的吞吐。
-        每步随机移动 5 个节点，N=50。
+        Throughput of batch_update (update multiple nodes at once) + compute_crossings.
+        Move 5 nodes randomly per step, N=50.
         """
         key = "batch5_medium_N50_p015"
         state, nodes = _make_bench_graph(50, 0.15, seed=50)
         rng = np.random.default_rng(51)
         n = len(nodes)
 
-        # 预热
+        # Warmup
         for _ in range(_WARMUP_ITERS):
             chosen = rng.choice(nodes, 5, replace=False).tolist()
             state.batch_update(chosen, rng.uniform(0, 1, (5, 2)))
@@ -880,9 +882,9 @@ class TestPerformanceFPS:
             baseline_fps = self._fps_data[key]
             threshold = baseline_fps * _REGRESSION_TOLERANCE
             assert fps >= threshold, (
-                f"[FPS 退化] {key}: 当前 {fps:.1f} < baseline {baseline_fps:.1f} "
-                f"× {_REGRESSION_TOLERANCE} = {threshold:.1f} fps"
+                f"[FPS degradation] {key}: current {fps:.1f} < baseline {baseline_fps:.1f} "
+                f"x {_REGRESSION_TOLERANCE} = {threshold:.1f} fps"
             )
         else:
             self._fps_data[key] = round(fps, 1)
-            print(f"[FPS] {key}: 已记录新 baseline = {fps:.1f} fps")
+            print(f"[FPS] {key}: new baseline recorded = {fps:.1f} fps")
